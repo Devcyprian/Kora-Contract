@@ -288,6 +288,12 @@ impl InvoiceNftContract {
 
     /// Set the authorized marketplace and financing pool contract addresses.
     /// Must be called by admin after deployment to enable status transitions.
+    ///
+    /// **Errors:**
+    /// - `KoraError::NotAdmin` — Caller is not the admin.
+    /// - `KoraError::InvalidAddress` — Either address is this contract, they are
+    ///   identical to each other, or either collides with the stored admin,
+    ///   access_control, or risk_registry address.
     pub fn set_authorized_callers(
         env: Env,
         admin: Address,
@@ -296,6 +302,19 @@ impl InvoiceNftContract {
     ) -> Result<(), KoraError> {
         admin.require_auth();
         Self::require_admin(&env, &admin)?;
+        kora_shared::validation::require_not_self(&env, &marketplace)?;
+        kora_shared::validation::require_not_self(&env, &financing_pool)?;
+        kora_shared::validation::require_distinct(&marketplace, &financing_pool)?;
+
+        // Neither role may collide with an existing privileged/wired address:
+        // doing so would let one key satisfy two authorization paths at once.
+        for wired in [DataKey::Admin, DataKey::AccessControl, DataKey::RiskRegistry] {
+            if let Some(existing) = env.storage().instance().get::<DataKey, Address>(&wired) {
+                kora_shared::validation::require_distinct(&marketplace, &existing)?;
+                kora_shared::validation::require_distinct(&financing_pool, &existing)?;
+            }
+        }
+
         env.storage().instance().set(&DataKey::Marketplace, &marketplace);
         env.storage().instance().set(&DataKey::FinancingPool, &financing_pool);
         Self::append_audit_entry(&env, &admin, AdminActionType::InvoiceNftSetAuthorizedCallers);
@@ -2794,6 +2813,60 @@ mod tests {
         let page1 = client.get_audit_log(&1u32, &2u32);
         assert_eq!(page1.len(), 1);
         assert_eq!(page1.get(0).unwrap().action, AdminActionType::InvoiceNftSetRiskRegistry);
+    }
+
+    // === set_authorized_callers validation
+
+    #[test]
+    fn test_set_authorized_callers_valid_pair_succeeds() {
+        let (env, admin, client) = setup();
+        let marketplace = Address::generate(&env);
+        let pool = Address::generate(&env);
+        client.set_authorized_callers(&admin, &marketplace, &pool);
+    }
+
+    #[test]
+    fn test_set_authorized_callers_identical_addresses_rejected() {
+        let (env, admin, client) = setup();
+        let same = Address::generate(&env);
+        let result = client.try_set_authorized_callers(&admin, &same, &same);
+        assert_eq!(result.unwrap_err().unwrap(), KoraError::InvalidAddress);
+    }
+
+    #[test]
+    fn test_set_authorized_callers_self_as_marketplace_rejected() {
+        let (env, admin, client) = setup();
+        let contract_id = client.address.clone();
+        let pool = Address::generate(&env);
+        let result = client.try_set_authorized_callers(&admin, &contract_id, &pool);
+        assert_eq!(result.unwrap_err().unwrap(), KoraError::InvalidAddress);
+    }
+
+    #[test]
+    fn test_set_authorized_callers_self_as_financing_pool_rejected() {
+        let (env, admin, client) = setup();
+        let contract_id = client.address.clone();
+        let marketplace = Address::generate(&env);
+        let result = client.try_set_authorized_callers(&admin, &marketplace, &contract_id);
+        assert_eq!(result.unwrap_err().unwrap(), KoraError::InvalidAddress);
+    }
+
+    #[test]
+    fn test_set_authorized_callers_collision_with_admin_rejected() {
+        let (env, admin, client) = setup();
+        let pool = Address::generate(&env);
+        let result = client.try_set_authorized_callers(&admin, &admin, &pool);
+        assert_eq!(result.unwrap_err().unwrap(), KoraError::InvalidAddress);
+    }
+
+    #[test]
+    fn test_set_authorized_callers_collision_with_risk_registry_rejected() {
+        let (env, admin, client) = setup();
+        let rr = Address::generate(&env);
+        client.set_risk_registry(&admin, &rr);
+        let marketplace = Address::generate(&env);
+        let result = client.try_set_authorized_callers(&admin, &marketplace, &rr);
+        assert_eq!(result.unwrap_err().unwrap(), KoraError::InvalidAddress);
     }
 }
 #![no_std]
