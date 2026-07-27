@@ -261,6 +261,21 @@ pub fn fee_rate_updated(env: &Env, by: &Address, old_bps: u32, new_bps: u32) {
     );
 }
 
+/// Emitted when part of a funding fee is routed to the invoice's referrer.
+/// Schema: (invoice_id, referrer, referral_fee, timestamp)
+pub fn referral_fee_paid(env: &Env, invoice_id: u64, referrer: &Address, referral_fee: i128) {
+    emit(
+        env,
+        symbol_short!("REF_FEE"),
+        (
+            invoice_id,
+            referrer.clone(),
+            referral_fee,
+            env.ledger().timestamp(),
+        ),
+    );
+}
+
 /// Schema: (actor=admin, fee_bps, timestamp)
 pub fn treasury_initialized(env: &Env, admin: &Address, fee_bps: u32) {
     emit(
