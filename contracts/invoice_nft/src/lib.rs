@@ -88,6 +88,11 @@ pub enum DataKey {
     SmeInvoiceIds(Address),
     /// Instance key: monotonic counter allocating the next batch-mint correlation ID.
     NextBatchId,
+    /// Instance key: `MintRateLimit` config. Absent means minting is unthrottled,
+    /// preserving pre-existing behaviour for deployments that never configure it.
+    MintRateLimit,
+    /// Persistent: `(window_start_ts, mints_used)` rolling mint window for an SME.
+    SmeMintWindow(Address),
     // ── Admin audit log ───────────────────────────────────────────────────────
     /// Next write position in the admin audit ring buffer (0..MAX_AUDIT_LOG_SIZE).
     AuditLogHead,
@@ -95,6 +100,14 @@ pub enum DataKey {
     AuditLogTotal,
     /// An admin audit log entry at ring-buffer position `n`.
     AuditEntry(u64),
+}
+
+/// Per-SME minting velocity cap: at most `max_mints` invoices per `window_secs`.
+#[contracttype]
+#[derive(Clone)]
+pub struct MintRateLimit {
+    pub max_mints: u32,
+    pub window_secs: u64,
 }
 
 /// Input type for a single invoice within a batch mint operation.
@@ -321,6 +334,50 @@ impl InvoiceNftContract {
         Ok(())
     }
 
+    /// Configure the per-SME minting velocity cap: at most `max_mints` invoices
+    /// within any `window_secs` rolling window. Admin only.
+    ///
+    /// While unset, minting is unthrottled, so existing deployments keep their
+    /// current behaviour until an admin opts in.
+    ///
+    /// **Errors:**
+    /// - `KoraError::NotAdmin` — Caller is not the admin.
+    /// - `KoraError::InvalidParameterValue` — `max_mints` or `window_secs` is zero.
+    pub fn set_mint_rate_limit(
+        env: Env,
+        admin: Address,
+        max_mints: u32,
+        window_secs: u64,
+    ) -> Result<(), KoraError> {
+        admin.require_auth();
+        Self::require_admin(&env, &admin)?;
+        if max_mints == 0 || window_secs == 0 {
+            return Err(KoraError::InvalidParameterValue);
+        }
+        env.storage().instance().set(
+            &DataKey::MintRateLimit,
+            &MintRateLimit {
+                max_mints,
+                window_secs,
+            },
+        );
+        Self::append_audit_entry(&env, &admin, AdminActionType::InvoiceNftSetMintRateLimit);
+        Ok(())
+    }
+
+    /// Return the configured per-SME mint rate limit, or `None` when unthrottled.
+    pub fn get_mint_rate_limit(env: Env) -> Option<MintRateLimit> {
+        env.storage().instance().get(&DataKey::MintRateLimit)
+    }
+
+    /// Return `(window_start_ts, mints_used)` for an SME's current mint window.
+    pub fn get_sme_mint_window(env: Env, sme: Address) -> (u64, u32) {
+        env.storage()
+            .persistent()
+            .get(&DataKey::SmeMintWindow(sme))
+            .unwrap_or((0u64, 0u32))
+    }
+
     /// Mint a new invoice NFT. Caller must be a verified SME.
     ///
     /// **Parameters:**
@@ -371,6 +428,8 @@ impl InvoiceNftContract {
         require_max_length_bytes(&debtor_hash, MAX_DEBTOR_HASH_LEN)?;
         require_non_empty_string(&ipfs_cid)?;
         require_max_length_string(&ipfs_cid, MAX_IPFS_CID_LEN)?;
+
+        Self::consume_mint_quota(&env, &sme, 1)?;
 
         // Credit-limit enforcement: if a risk_registry is wired up, check the
         // SME's pre-approved credit limit against their current outstanding exposure.
@@ -460,6 +519,10 @@ impl InvoiceNftContract {
             require_non_empty_string(&entry.ipfs_cid)?;
             require_max_length_string(&entry.ipfs_cid, MAX_IPFS_CID_LEN)?;
         }
+
+        // Charged once for the whole batch, but at N units, so a batch cannot be
+        // used to sidestep the per-invoice velocity cap.
+        Self::consume_mint_quota(&env, &sme, invoices.len())?;
 
         // ── Phase 2: mint each invoice ────────────────────────────────────────
         let mut ids: Vec<u64> = Vec::new(&env);
@@ -1327,6 +1390,43 @@ impl InvoiceNftContract {
         env.storage()
             .persistent()
             .extend_ttl(key, PERSISTENT_TTL_THRESHOLD, PERSISTENT_TTL_BUMP);
+    }
+
+    /// Charge `count` mints against `sme`'s rolling rate-limit window.
+    ///
+    /// A batch charges one unit per invoice, so a batch of N counts as N. The
+    /// window is a fixed-start window: it resets only once `window_secs` has
+    /// fully elapsed since the first mint in the window.
+    fn consume_mint_quota(env: &Env, sme: &Address, count: u32) -> Result<(), KoraError> {
+        let cfg: MintRateLimit = match env.storage().instance().get(&DataKey::MintRateLimit) {
+            Some(cfg) => cfg,
+            None => return Ok(()),
+        };
+
+        let now = env.ledger().timestamp();
+        let key = DataKey::SmeMintWindow(sme.clone());
+        let (start, used): (u64, u32) = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or((now, 0u32));
+
+        let (start, used) = if now.saturating_sub(start) >= cfg.window_secs {
+            (now, 0u32)
+        } else {
+            (start, used)
+        };
+
+        let new_used = used
+            .checked_add(count)
+            .ok_or(KoraError::ArithmeticOverflow)?;
+        if new_used > cfg.max_mints {
+            return Err(KoraError::MintRateLimitExceeded);
+        }
+
+        env.storage().persistent().set(&key, &(start, new_used));
+        Self::bump_persistent(env, &key);
+        Ok(())
     }
 
     /// Append a single newly-minted invoice ID to `sme`'s invoice index.
@@ -2857,6 +2957,159 @@ mod tests {
         let pool = Address::generate(&env);
         let result = client.try_set_authorized_callers(&admin, &admin, &pool);
         assert_eq!(result.unwrap_err().unwrap(), KoraError::InvalidAddress);
+    }
+
+    // === per-SME mint rate limiting
+
+    fn mint_for(env: &Env, client: &InvoiceNftContractClient, sme: &Address) -> u64 {
+        client.mint_invoice(
+            sme,
+            &Bytes::from_slice(env, &[1u8; 32]),
+            &1_000_000_000i128,
+            &Symbol::new(env, "USDC"),
+            &(env.ledger().timestamp() + 86_400 * 30),
+            &String::from_str(
+                env,
+                "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi",
+            ),
+            &50u32,
+            &None,
+        )
+    }
+
+    /// Attempt a mint that is expected to fail, returning the contract error.
+    fn mint_err(env: &Env, client: &InvoiceNftContractClient, sme: &Address) -> KoraError {
+        client
+            .try_mint_invoice(
+                sme,
+                &Bytes::from_slice(env, &[1u8; 32]),
+                &1_000_000_000i128,
+                &Symbol::new(env, "USDC"),
+                &(env.ledger().timestamp() + 86_400 * 30),
+                &String::from_str(
+                    env,
+                    "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi",
+                ),
+                &50u32,
+                &None,
+            )
+            .unwrap_err()
+            .unwrap()
+    }
+
+    fn batch_input(env: &Env) -> BatchInvoiceInput {
+        BatchInvoiceInput {
+            debtor_hash: Bytes::from_slice(env, &[1u8; 32]),
+            amount: 1_000_000_000i128,
+            currency: Symbol::new(env, "USDC"),
+            due_date: env.ledger().timestamp() + 86_400 * 30,
+            ipfs_cid: String::from_str(
+                env,
+                "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi",
+            ),
+            risk_score: 50,
+            notes: None,
+        }
+    }
+
+    fn advance(env: &Env, secs: u64) {
+        let ts = env.ledger().timestamp();
+        env.ledger().set_timestamp(ts + secs);
+    }
+
+    #[test]
+    fn test_mint_unthrottled_when_rate_limit_unset() {
+        let (env, _admin, client) = setup();
+        let sme = Address::generate(&env);
+        assert!(client.get_mint_rate_limit().is_none());
+        for _ in 0..5 {
+            mint_for(&env, &client, &sme);
+        }
+    }
+
+    #[test]
+    fn test_set_mint_rate_limit_rejects_zero_values() {
+        let (_env, admin, client) = setup();
+        assert_eq!(
+            client.try_set_mint_rate_limit(&admin, &0u32, &3600u64).unwrap_err().unwrap(),
+            KoraError::InvalidParameterValue
+        );
+        assert_eq!(
+            client.try_set_mint_rate_limit(&admin, &3u32, &0u64).unwrap_err().unwrap(),
+            KoraError::InvalidParameterValue
+        );
+    }
+
+    #[test]
+    fn test_mint_rate_limit_blocks_then_recovers_after_window() {
+        let (env, admin, client) = setup();
+        client.set_mint_rate_limit(&admin, &3u32, &3600u64);
+        let sme = Address::generate(&env);
+
+        for _ in 0..3 {
+            mint_for(&env, &client, &sme);
+        }
+        assert_eq!(
+            mint_err(&env, &client, &sme),
+            KoraError::MintRateLimitExceeded
+        );
+
+        advance(&env, 3600);
+        mint_for(&env, &client, &sme);
+        assert_eq!(client.get_sme_mint_window(&sme).1, 1u32);
+    }
+
+    #[test]
+    fn test_mint_rate_limit_is_per_sme() {
+        let (env, admin, client) = setup();
+        client.set_mint_rate_limit(&admin, &1u32, &3600u64);
+        let sme_a = Address::generate(&env);
+        let sme_b = Address::generate(&env);
+
+        mint_for(&env, &client, &sme_a);
+        assert_eq!(
+            mint_err(&env, &client, &sme_a),
+            KoraError::MintRateLimitExceeded
+        );
+        mint_for(&env, &client, &sme_b);
+    }
+
+    #[test]
+    fn test_batch_mint_counts_each_invoice_against_window() {
+        let (env, admin, client) = setup();
+        client.set_mint_rate_limit(&admin, &3u32, &3600u64);
+        let sme = Address::generate(&env);
+
+        let mut batch: Vec<BatchInvoiceInput> = Vec::new(&env);
+        for _ in 0..3 {
+            batch.push_back(batch_input(&env));
+        }
+        client.mint_invoices_batch(&sme, &batch);
+        assert_eq!(client.get_sme_mint_window(&sme).1, 3u32);
+
+        // A single further mint must now be rejected, proving the batch was
+        // charged per invoice rather than as one call.
+        assert_eq!(
+            mint_err(&env, &client, &sme),
+            KoraError::MintRateLimitExceeded
+        );
+    }
+
+    #[test]
+    fn test_batch_mint_exceeding_limit_is_rejected_atomically() {
+        let (env, admin, client) = setup();
+        client.set_mint_rate_limit(&admin, &2u32, &3600u64);
+        let sme = Address::generate(&env);
+
+        let mut batch: Vec<BatchInvoiceInput> = Vec::new(&env);
+        for _ in 0..3 {
+            batch.push_back(batch_input(&env));
+        }
+        assert_eq!(
+            client.try_mint_invoices_batch(&sme, &batch).unwrap_err().unwrap(),
+            KoraError::MintRateLimitExceeded
+        );
+        assert_eq!(client.get_sme_invoice_ids(&sme, &0u32, &10u32).len(), 0);
     }
 
     #[test]

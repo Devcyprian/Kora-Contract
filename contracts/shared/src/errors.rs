@@ -98,6 +98,8 @@ pub enum KoraError {
     CreditLimitExceeded = 121,
     // invoice_nft: currency symbol is not on the allowlist
     CurrencyNotAllowed = 122,
+    // invoice_nft: SME exceeded the configured per-window minting velocity cap
+    MintRateLimitExceeded = 123,
 }
 use soroban_sdk::contracterror;
 
