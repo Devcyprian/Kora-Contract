@@ -100,6 +100,10 @@ pub enum KoraError {
     CurrencyNotAllowed = 122,
     // invoice_nft: SME exceeded the configured per-window minting velocity cap
     MintRateLimitExceeded = 123,
+    // marketplace: action requires a multisig quorum, not a direct admin call
+    MultisigApprovalRequired = 124,
+    // marketplace: no multisig signer set is configured on access_control
+    MultisigNotConfigured = 125,
 }
 use soroban_sdk::contracterror;
 
