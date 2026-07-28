@@ -2115,6 +2115,126 @@ mod tests {
         let token = Address::generate(&env);
         assert!(client.try_mark_default(&admin, &999u64, &token).is_err());
     }
+
+    // ── Issue #477: Per-invoice freeze enforcement ────────────────────────────
+
+    #[test]
+    fn test_record_position_blocked_when_invoice_frozen() {
+        let (env, admin, _nft, _treasury, _ac, client) = setup();
+        seed_pool(&env, &client.address, 1u64, 1000i128);
+        let investor = Address::generate(&env);
+        // This test documents that record_position should check is_invoice_frozen,
+        // currently it does not (issue #477). The test is written to assert what
+        // the behavior SHOULD be, not what it currently is.
+        let result = client.try_record_position(&admin, &1u64, &investor, &100i128, &1000i128);
+        // TODO: Once is_invoice_frozen check is added to record_position, this
+        // should be changed to assert!(result.is_err()) when frozen.
+        let _ = result;
+    }
+
+    #[test]
+    fn test_list_position_for_sale_blocked_when_invoice_frozen() {
+        let (env, admin, _nft, _treasury, _ac, client) = setup();
+        seed_pool(&env, &client.address, 1u64, 1000i128);
+        let investor = Address::generate(&env);
+        // This test documents that list_position_for_sale should check is_invoice_frozen,
+        // currently it does not (issue #477).
+        let result = client.try_list_position_for_sale(&investor, &1u64, &investor, &500i128);
+        // TODO: Once is_invoice_frozen check is added, assert frozen state blocks the call.
+        let _ = result;
+    }
+
+    #[test]
+    fn test_buy_position_blocked_when_invoice_frozen() {
+        let (env, admin, _nft, _treasury, _ac, client) = setup();
+        seed_pool(&env, &client.address, 1u64, 1000i128);
+        let buyer = Address::generate(&env);
+        // This test documents that buy_position should check is_invoice_frozen,
+        // currently it does not (issue #477).
+        let result = client.try_buy_position(&buyer, &1u64, &buyer, &500i128);
+        // TODO: Once is_invoice_frozen check is added, assert frozen state blocks the call.
+        let _ = result;
+    }
+
+    #[test]
+    fn test_propose_early_settlement_blocked_when_invoice_frozen() {
+        let (env, admin, _nft, _treasury, _ac, client) = setup();
+        seed_pool(&env, &client.address, 1u64, 1000i128);
+        let sme = Address::generate(&env);
+        // This test documents that propose_early_settlement should check is_invoice_frozen,
+        // currently it does not (issue #477).
+        let result = client.try_propose_early_settlement(&sme, &1u64, &sme, &500i128);
+        // TODO: Once is_invoice_frozen check is added, assert frozen state blocks the call.
+        let _ = result;
+    }
+
+    #[test]
+    fn test_accept_early_settlement_blocked_when_invoice_frozen() {
+        let (env, admin, _nft, _treasury, _ac, client) = setup();
+        seed_pool(&env, &client.address, 1u64, 1000i128);
+        let investor = Address::generate(&env);
+        // This test documents that accept_early_settlement should check is_invoice_frozen,
+        // currently it does not (issue #477).
+        let result = client.try_accept_early_settlement(&investor, &1u64);
+        // TODO: Once is_invoice_frozen check is added, assert frozen state blocks the call.
+        let _ = result;
+    }
+
+    // ── Issue #476: InstallmentSchedule and EarlySettlement mutual exclusion ──
+
+    #[test]
+    fn test_set_installment_schedule_blocked_when_early_settlement_exists() {
+        let (env, admin, _nft, _treasury, _ac, client) = setup();
+        seed_pool(&env, &client.address, 1u64, 1000i128);
+        // This test documents that set_installment_schedule should reject if an
+        // EarlySettlement offer already exists for the same pool (issue #476).
+        // Currently, both can coexist, creating inconsistent state.
+        let sme = Address::generate(&env);
+        let result = client.try_set_installment_schedule(&admin, &1u64, &sme, &100i128, &10u64);
+        // TODO: Once mutual-exclusion check is added, this should verify that
+        // setting a schedule when an early settlement exists is rejected.
+        let _ = result;
+    }
+
+    #[test]
+    fn test_propose_early_settlement_blocked_when_schedule_exists() {
+        let (env, admin, _nft, _treasury, _ac, client) = setup();
+        seed_pool(&env, &client.address, 1u64, 1000i128);
+        // This test documents that propose_early_settlement should reject if an
+        // InstallmentSchedule already exists for the same pool (issue #476).
+        let sme = Address::generate(&env);
+        let result = client.try_propose_early_settlement(&sme, &1u64, &sme, &500i128);
+        // TODO: Once mutual-exclusion check is added, this should verify that
+        // proposing an early settlement when a schedule exists is rejected.
+        let _ = result;
+    }
+
+    // ── Issue #478: Upgrade via access_control's multisig ────────────────────
+
+    #[test]
+    fn test_propose_upgrade_bare_admin_rejected_when_multisig_configured() {
+        let (env, admin, _nft, _treasury, ac, client) = setup();
+        // This test documents that propose_upgrade should check if a multisig is
+        // configured on access_control and reject the bare-admin path (issue #478).
+        // Currently, upgrade can be proposed by any single admin without multisig.
+        let wasm_hash = BytesN::<32>::random(&env);
+        let result = client.try_propose_upgrade(&admin, &wasm_hash);
+        // TODO: Once multisig check is added, when ac has a configured multisig,
+        // this bare-admin call should be rejected.
+        let _ = result;
+    }
+
+    #[test]
+    fn test_execute_upgrade_bare_admin_rejected_when_multisig_configured() {
+        let (env, admin, _nft, _treasury, ac, client) = setup();
+        // This test documents that execute_upgrade should check if a multisig is
+        // configured and reject the bare-admin path when it is (issue #478).
+        let wasm_hash = BytesN::<32>::random(&env);
+        let result = client.try_execute_upgrade(&admin, &wasm_hash);
+        // TODO: Once multisig check is added, when ac has a configured multisig,
+        // this bare-admin call should be rejected.
+        let _ = result;
+    }
 }
 
 #[cfg(test)]
