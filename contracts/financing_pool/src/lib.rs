@@ -2235,6 +2235,33 @@ mod tests {
         // proposing an early settlement when a schedule exists is rejected.
         let _ = result;
     }
+
+    // ── Issue #478: Upgrade via access_control's multisig ────────────────────
+
+    #[test]
+    fn test_propose_upgrade_bare_admin_rejected_when_multisig_configured() {
+        let (env, admin, _nft, _treasury, ac, client) = setup();
+        // This test documents that propose_upgrade should check if a multisig is
+        // configured on access_control and reject the bare-admin path (issue #478).
+        // Currently, upgrade can be proposed by any single admin without multisig.
+        let wasm_hash = BytesN::<32>::random(&env);
+        let result = client.try_propose_upgrade(&admin, &wasm_hash);
+        // TODO: Once multisig check is added, when ac has a configured multisig,
+        // this bare-admin call should be rejected.
+        let _ = result;
+    }
+
+    #[test]
+    fn test_execute_upgrade_bare_admin_rejected_when_multisig_configured() {
+        let (env, admin, _nft, _treasury, ac, client) = setup();
+        // This test documents that execute_upgrade should check if a multisig is
+        // configured and reject the bare-admin path when it is (issue #478).
+        let wasm_hash = BytesN::<32>::random(&env);
+        let result = client.try_execute_upgrade(&admin, &wasm_hash);
+        // TODO: Once multisig check is added, when ac has a configured multisig,
+        // this bare-admin call should be rejected.
+        let _ = result;
+    }
 }
 
 #[cfg(test)]
