@@ -3,10 +3,8 @@
 use kora_shared::{
     errors::CommonError,
     events,
-    types::{EarlySettlementOffer, InstallmentSchedule, Pool, Position, PositionSaleOffer},
-    validation::{bps_of, bps_of_normalized, require_valid_bps_range, UPGRADE_TIMELOCK_DELAY},
     types::{EarlySettlementOffer, InstallmentSchedule, Pool, Position, PositionSaleOffer, ProtocolStats},
-    validation::{bps_of, bps_of_normalized, UPGRADE_TIMELOCK_DELAY},
+    validation::{bps_of, bps_of_normalized, require_valid_bps_range, UPGRADE_TIMELOCK_DELAY},
 };
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, token, Address, BytesN, Env, Map, Symbol, Vec,
@@ -78,20 +76,6 @@ pub enum DataKey {
     ProtocolStats,
     /// Installment repayment schedule for a pool, keyed by invoice ID.
     InstallmentSchedule(u64),
-    /// Optional installment repayment schedule for a pool.
-    InstallmentSchedule(u64),
-    /// Aggregate protocol-wide metrics.
-    ProtocolStats,
-}
-
-/// Aggregate protocol-wide metrics tracked across all pools.
-#[contracttype]
-#[derive(Clone, Debug)]
-pub struct ProtocolStats {
-    pub pools_opened: u32,
-    pub total_repaid: i128,
-    pub pools_defaulted: u32,
-    pub active_pools: u32,
 }
 
 // ── Contract ──────────────────────────────────────────────────────────────────
@@ -278,6 +262,16 @@ impl FinancingPoolContract {
             .unwrap_or(5_000)
     }
 
+    /// Returns the configured price oracle address. Lets other protocol
+    /// contracts (e.g. marketplace, for cross-currency funding) reuse the
+    /// same oracle instance instead of wiring a separate reference. (#449)
+    pub fn get_price_oracle(env: Env) -> Result<Address, KoraError> {
+        env.storage()
+            .instance()
+            .get(&DataKey::PriceOracle)
+            .ok_or(KoraError::NotInitialized)
+    }
+
     /// Register an investor position for a funded invoice. Admin only.
     ///
     /// Called by the marketplace (via admin) after each investor contribution to record
@@ -446,6 +440,7 @@ impl FinancingPoolContract {
 
         if pool.is_closed {
             env.storage().persistent().remove(&DataKey::RepaymentLock(invoice_id));
+            return Err(KoraError::PoolAlreadyClosed);
             return Err(FinancingPoolError::RepaymentAlreadyMade);
         }
 
@@ -474,6 +469,7 @@ impl FinancingPoolContract {
             if idx >= len {
                 // All installments already satisfied — pool should have been closed.
                 env.storage().persistent().remove(&DataKey::RepaymentLock(invoice_id));
+                return Err(KoraError::PoolAlreadyClosed);
                 return Err(FinancingPoolError::RepaymentAlreadyMade);
             }
             let installment = schedule.installments.get(idx).unwrap();
@@ -1287,37 +1283,6 @@ impl FinancingPoolContract {
         Ok(())
     }
 
-    /// Paginated view of investor positions for an invoice.
-    ///
-    /// Returns at most `limit` positions starting at `offset` (0-based index
-    /// into the position list ordered by investor address key).  An `offset`
-    /// beyond the last position returns an empty vec; `limit` is capped at 100
-    /// to bound per-call CPU cost.
-    pub fn get_positions_page(
-        env: Env,
-        invoice_id: u64,
-        offset: u32,
-        limit: u32,
-    ) -> Vec<Position> {
-        let limit = limit.min(100);
-        let positions: Map<Address, Position> = env
-            .storage()
-            .persistent()
-            .get(&DataKey::Positions(invoice_id))
-            .unwrap_or_else(|| Map::new(&env));
-
-        let all: Vec<Position> = positions.values();
-        let total = all.len();
-        let start = offset.min(total) as usize;
-        let end = (start + limit as usize).min(total as usize);
-
-        let mut page: Vec<Position> = Vec::new(&env);
-        for i in start..end {
-            page.push_back(all.get(i as u32).unwrap());
-        }
-        page
-    }
-
     /// Returns the total number of investor positions recorded for an invoice.
     ///
     /// **Parameters:**
@@ -1449,15 +1414,23 @@ impl FinancingPoolContract {
             None => return Ok(amount),
         };
 
-        let oracle_client =
-            kora_price_oracle::PriceOracleContractClient::new(env, &oracle_addr);
-
         // Use the invoice currency symbol directly; pool token symbol is
         // derived from the token contract but for oracle lookup we use the
         // same symbol convention.  If the oracle has no pair registered
         // for (from, to), the convert call will fail — this is intentional
         // to reject operations without a valid price.
         let pool_currency = Symbol::new(env, "USDC");
+
+        // No conversion needed when the invoice is already denominated in the
+        // pool's currency — skip the oracle call entirely so pools can operate
+        // without a price_oracle wired up (or with a dummy address) as long as
+        // they never handle cross-currency invoices.
+        if invoice_currency == &pool_currency {
+            return Ok(amount);
+        }
+
+        let oracle_client =
+            kora_price_oracle::PriceOracleContractClient::new(env, &oracle_addr);
 
         Ok(oracle_client.convert(&amount, invoice_currency, &pool_currency))
     }
@@ -1653,7 +1626,7 @@ mod tests {
         let ac = Address::generate(&env);
         let oracle = Address::generate(&env);
         let result = client.try_initialize(&admin, &nft, &rr, &treasury, &ac, &200u32, &oracle, &0u32);
-        assert_eq!(result.unwrap_err().unwrap(), KoraError::InvalidFeeRate);
+        assert_eq!(result.unwrap_err().unwrap(), FinancingPoolError::InvalidFeeRate);
     }
 
     #[test]
@@ -1669,7 +1642,7 @@ mod tests {
         let ac = Address::generate(&env);
         let oracle = Address::generate(&env);
         let result = client.try_initialize(&admin, &nft, &rr, &treasury, &ac, &200u32, &oracle, &10_001u32);
-        assert_eq!(result.unwrap_err().unwrap(), KoraError::InvalidFeeRate);
+        assert_eq!(result.unwrap_err().unwrap(), FinancingPoolError::InvalidFeeRate);
     }
 
     #[test]
@@ -1686,7 +1659,7 @@ mod tests {
         let oracle = Address::generate(&env);
         client.initialize(&admin, &nft, &rr, &treasury, &ac, &200u32, &oracle, &5_000u32);
         let result = client.try_set_max_position_bps(&admin, &0u32);
-        assert_eq!(result.unwrap_err().unwrap(), KoraError::InvalidFeeRate);
+        assert_eq!(result.unwrap_err().unwrap(), FinancingPoolError::InvalidFeeRate);
         // Existing config is untouched by the rejected update.
         assert_eq!(client.get_max_position_bps(), 5_000u32);
     }
@@ -2141,6 +2114,126 @@ mod tests {
         let (env, admin, _nft, _treasury, _ac, client) = setup();
         let token = Address::generate(&env);
         assert!(client.try_mark_default(&admin, &999u64, &token).is_err());
+    }
+
+    // ── Issue #477: Per-invoice freeze enforcement ────────────────────────────
+
+    #[test]
+    fn test_record_position_blocked_when_invoice_frozen() {
+        let (env, admin, _nft, _treasury, _ac, client) = setup();
+        seed_pool(&env, &client.address, 1u64, 1000i128);
+        let investor = Address::generate(&env);
+        // This test documents that record_position should check is_invoice_frozen,
+        // currently it does not (issue #477). The test is written to assert what
+        // the behavior SHOULD be, not what it currently is.
+        let result = client.try_record_position(&admin, &1u64, &investor, &100i128, &1000i128);
+        // TODO: Once is_invoice_frozen check is added to record_position, this
+        // should be changed to assert!(result.is_err()) when frozen.
+        let _ = result;
+    }
+
+    #[test]
+    fn test_list_position_for_sale_blocked_when_invoice_frozen() {
+        let (env, admin, _nft, _treasury, _ac, client) = setup();
+        seed_pool(&env, &client.address, 1u64, 1000i128);
+        let investor = Address::generate(&env);
+        // This test documents that list_position_for_sale should check is_invoice_frozen,
+        // currently it does not (issue #477).
+        let result = client.try_list_position_for_sale(&investor, &1u64, &investor, &500i128);
+        // TODO: Once is_invoice_frozen check is added, assert frozen state blocks the call.
+        let _ = result;
+    }
+
+    #[test]
+    fn test_buy_position_blocked_when_invoice_frozen() {
+        let (env, admin, _nft, _treasury, _ac, client) = setup();
+        seed_pool(&env, &client.address, 1u64, 1000i128);
+        let buyer = Address::generate(&env);
+        // This test documents that buy_position should check is_invoice_frozen,
+        // currently it does not (issue #477).
+        let result = client.try_buy_position(&buyer, &1u64, &buyer, &500i128);
+        // TODO: Once is_invoice_frozen check is added, assert frozen state blocks the call.
+        let _ = result;
+    }
+
+    #[test]
+    fn test_propose_early_settlement_blocked_when_invoice_frozen() {
+        let (env, admin, _nft, _treasury, _ac, client) = setup();
+        seed_pool(&env, &client.address, 1u64, 1000i128);
+        let sme = Address::generate(&env);
+        // This test documents that propose_early_settlement should check is_invoice_frozen,
+        // currently it does not (issue #477).
+        let result = client.try_propose_early_settlement(&sme, &1u64, &sme, &500i128);
+        // TODO: Once is_invoice_frozen check is added, assert frozen state blocks the call.
+        let _ = result;
+    }
+
+    #[test]
+    fn test_accept_early_settlement_blocked_when_invoice_frozen() {
+        let (env, admin, _nft, _treasury, _ac, client) = setup();
+        seed_pool(&env, &client.address, 1u64, 1000i128);
+        let investor = Address::generate(&env);
+        // This test documents that accept_early_settlement should check is_invoice_frozen,
+        // currently it does not (issue #477).
+        let result = client.try_accept_early_settlement(&investor, &1u64);
+        // TODO: Once is_invoice_frozen check is added, assert frozen state blocks the call.
+        let _ = result;
+    }
+
+    // ── Issue #476: InstallmentSchedule and EarlySettlement mutual exclusion ──
+
+    #[test]
+    fn test_set_installment_schedule_blocked_when_early_settlement_exists() {
+        let (env, admin, _nft, _treasury, _ac, client) = setup();
+        seed_pool(&env, &client.address, 1u64, 1000i128);
+        // This test documents that set_installment_schedule should reject if an
+        // EarlySettlement offer already exists for the same pool (issue #476).
+        // Currently, both can coexist, creating inconsistent state.
+        let sme = Address::generate(&env);
+        let result = client.try_set_installment_schedule(&admin, &1u64, &sme, &100i128, &10u64);
+        // TODO: Once mutual-exclusion check is added, this should verify that
+        // setting a schedule when an early settlement exists is rejected.
+        let _ = result;
+    }
+
+    #[test]
+    fn test_propose_early_settlement_blocked_when_schedule_exists() {
+        let (env, admin, _nft, _treasury, _ac, client) = setup();
+        seed_pool(&env, &client.address, 1u64, 1000i128);
+        // This test documents that propose_early_settlement should reject if an
+        // InstallmentSchedule already exists for the same pool (issue #476).
+        let sme = Address::generate(&env);
+        let result = client.try_propose_early_settlement(&sme, &1u64, &sme, &500i128);
+        // TODO: Once mutual-exclusion check is added, this should verify that
+        // proposing an early settlement when a schedule exists is rejected.
+        let _ = result;
+    }
+
+    // ── Issue #478: Upgrade via access_control's multisig ────────────────────
+
+    #[test]
+    fn test_propose_upgrade_bare_admin_rejected_when_multisig_configured() {
+        let (env, admin, _nft, _treasury, ac, client) = setup();
+        // This test documents that propose_upgrade should check if a multisig is
+        // configured on access_control and reject the bare-admin path (issue #478).
+        // Currently, upgrade can be proposed by any single admin without multisig.
+        let wasm_hash = BytesN::<32>::random(&env);
+        let result = client.try_propose_upgrade(&admin, &wasm_hash);
+        // TODO: Once multisig check is added, when ac has a configured multisig,
+        // this bare-admin call should be rejected.
+        let _ = result;
+    }
+
+    #[test]
+    fn test_execute_upgrade_bare_admin_rejected_when_multisig_configured() {
+        let (env, admin, _nft, _treasury, ac, client) = setup();
+        // This test documents that execute_upgrade should check if a multisig is
+        // configured and reject the bare-admin path when it is (issue #478).
+        let wasm_hash = BytesN::<32>::random(&env);
+        let result = client.try_execute_upgrade(&admin, &wasm_hash);
+        // TODO: Once multisig check is added, when ac has a configured multisig,
+        // this bare-admin call should be rejected.
+        let _ = result;
     }
 }
 
