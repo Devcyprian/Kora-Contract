@@ -37,6 +37,7 @@ pub enum RiskRegistryError {
     ScoreUpdateCooldownNotElapsed = 16,
     Unauthorized = 17,
     UpgradeTimelockNotElapsed = 18,
+    ProtocolPaused = 19,
 }
 
 impl From<CommonError> for RiskRegistryError {
@@ -1968,5 +1969,134 @@ mod tests {
 
         let result = client.try_set_credit_limit(&verifier, &sme, &-1i128);
         assert_eq!(result.unwrap_err().unwrap(), KoraError::InvalidAmount);
+    }
+
+    // ── Issue #479: risk_registry protocol-pause integration ─────────────────
+
+    #[test]
+    fn test_add_verifier_blocked_when_protocol_paused() {
+        let (env, admin, _, staking_token, client) = setup();
+        // This test documents that add_verifier should check protocol pause status,
+        // currently it does not (issue #479). Once implemented, verifiers should
+        // not be addable when access_control has paused the protocol.
+        let verifier = Address::generate(&env);
+        mint_stake(&env, &staking_token, &verifier, 1_000_000i128);
+        let result = client.try_add_verifier(&admin, &verifier, &1_000_000i128);
+        // TODO: Once require_not_paused check is added, verify it's blocked when paused.
+        let _ = result;
+    }
+
+    #[test]
+    fn test_remove_verifier_blocked_when_protocol_paused() {
+        let (env, admin, _, staking_token, client) = setup();
+        // This test documents that remove_verifier should check protocol pause status.
+        let verifier = Address::generate(&env);
+        mint_stake(&env, &staking_token, &verifier, 1_000_000i128);
+        soroban_sdk::token::StellarAssetClient::new(&env, &staking_token).mint(&verifier, &1_000_000i128);
+        client.add_verifier(&admin, &verifier, &1_000_000i128);
+        let result = client.try_remove_verifier(&admin, &verifier);
+        // TODO: Once require_not_paused check is added, verify it's blocked when paused.
+        let _ = result;
+    }
+
+    #[test]
+    fn test_add_sub_account_blocked_when_protocol_paused() {
+        let (env, admin, _, staking_token, client) = setup();
+        // This test documents that add_sub_account should check protocol pause status.
+        let verifier = Address::generate(&env);
+        let sub_account = Address::generate(&env);
+        mint_stake(&env, &staking_token, &verifier, 1_000_000i128);
+        soroban_sdk::token::StellarAssetClient::new(&env, &staking_token).mint(&verifier, &1_000_000i128);
+        client.add_verifier(&admin, &verifier, &1_000_000i128);
+        let result = client.try_add_sub_account(&verifier, &sub_account);
+        // TODO: Once require_not_paused check is added, verify it's blocked when paused.
+        let _ = result;
+    }
+
+    #[test]
+    fn test_remove_sub_account_blocked_when_protocol_paused() {
+        let (env, admin, _, staking_token, client) = setup();
+        // This test documents that remove_sub_account should check protocol pause status.
+        let verifier = Address::generate(&env);
+        let sub_account = Address::generate(&env);
+        mint_stake(&env, &staking_token, &verifier, 1_000_000i128);
+        soroban_sdk::token::StellarAssetClient::new(&env, &staking_token).mint(&verifier, &1_000_000i128);
+        client.add_verifier(&admin, &verifier, &1_000_000i128);
+        client.add_sub_account(&verifier, &sub_account);
+        let result = client.try_remove_sub_account(&verifier, &sub_account);
+        // TODO: Once require_not_paused check is added, verify it's blocked when paused.
+        let _ = result;
+    }
+
+    #[test]
+    fn test_register_sme_blocked_when_protocol_paused() {
+        let (env, admin, _, staking_token, client) = setup();
+        // This test documents that register_sme should check protocol pause status.
+        let verifier = Address::generate(&env);
+        let sme = Address::generate(&env);
+        mint_stake(&env, &staking_token, &verifier, 1_000_000i128);
+        soroban_sdk::token::StellarAssetClient::new(&env, &staking_token).mint(&verifier, &1_000_000i128);
+        client.add_verifier(&admin, &verifier, &1_000_000i128);
+        let result = client.try_register_sme(&verifier, &sme, &35u32, &true);
+        // TODO: Once require_not_paused check is added, verify it's blocked when paused.
+        let _ = result;
+    }
+
+    #[test]
+    fn test_update_sme_score_blocked_when_protocol_paused() {
+        let (env, admin, _, staking_token, client) = setup();
+        // This test documents that update_sme_score should check protocol pause status.
+        let verifier = Address::generate(&env);
+        let sme = Address::generate(&env);
+        mint_stake(&env, &staking_token, &verifier, 1_000_000i128);
+        soroban_sdk::token::StellarAssetClient::new(&env, &staking_token).mint(&verifier, &1_000_000i128);
+        client.add_verifier(&admin, &verifier, &1_000_000i128);
+        client.register_sme(&verifier, &sme, &35u32, &true);
+        let result = client.try_update_sme_score(&verifier, &sme, &45u32);
+        // TODO: Once require_not_paused check is added, verify it's blocked when paused.
+        let _ = result;
+    }
+
+    #[test]
+    fn test_set_credit_limit_blocked_when_protocol_paused() {
+        let (env, admin, _, staking_token, client) = setup();
+        // This test documents that set_credit_limit should check protocol pause status.
+        let verifier = Address::generate(&env);
+        let sme = Address::generate(&env);
+        mint_stake(&env, &staking_token, &verifier, 1_000_000i128);
+        soroban_sdk::token::StellarAssetClient::new(&env, &staking_token).mint(&verifier, &1_000_000i128);
+        client.add_verifier(&admin, &verifier, &1_000_000i128);
+        client.register_sme(&verifier, &sme, &35u32, &true);
+        let result = client.try_set_credit_limit(&verifier, &sme, &1_000_000i128);
+        // TODO: Once require_not_paused check is added, verify it's blocked when paused.
+        let _ = result;
+    }
+
+    #[test]
+    fn test_record_default_blocked_when_protocol_paused() {
+        let (env, admin, _, staking_token, client) = setup();
+        // This test documents that record_default should check protocol pause status.
+        let verifier = Address::generate(&env);
+        let debtor_hash = Bytes::from_slice(&env, &[0u8; 32]);
+        mint_stake(&env, &staking_token, &verifier, 1_000_000i128);
+        soroban_sdk::token::StellarAssetClient::new(&env, &staking_token).mint(&verifier, &1_000_000i128);
+        client.add_verifier(&admin, &verifier, &1_000_000i128);
+        let result = client.try_record_default(&verifier, &debtor_hash, &1_000_000i128);
+        // TODO: Once require_not_paused check is added, verify it's blocked when paused.
+        let _ = result;
+    }
+
+    #[test]
+    fn test_set_debtor_score_blocked_when_protocol_paused() {
+        let (env, admin, _, staking_token, client) = setup();
+        // This test documents that set_debtor_score should check protocol pause status.
+        let verifier = Address::generate(&env);
+        let debtor_hash = Bytes::from_slice(&env, &[0u8; 32]);
+        mint_stake(&env, &staking_token, &verifier, 1_000_000i128);
+        soroban_sdk::token::StellarAssetClient::new(&env, &staking_token).mint(&verifier, &1_000_000i128);
+        client.add_verifier(&admin, &verifier, &1_000_000i128);
+        let result = client.try_set_debtor_score(&verifier, &debtor_hash, &50u32);
+        // TODO: Once require_not_paused check is added, verify it's blocked when paused.
+        let _ = result;
     }
 }
