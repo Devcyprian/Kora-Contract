@@ -394,4 +394,185 @@ mod financing_pool_edge_cases {
 
         // Would need to set up a pool with specific amount first
     }
+
+    // ── Issue #467: Pool.total_funded Tracking ──────────────────────────────────
+
+    #[test]
+    fn test_total_funded_updated_on_record_position() {
+        let t = setup();
+
+        let invoice_id = 1u64;
+        let marketplace = Address::generate(&t.env);
+
+        // Record position for investor1
+        let amount1 = 5_000i128;
+        t.pool_client.record_position(
+            &marketplace,
+            &invoice_id,
+            &t.investor1,
+            &amount1,
+        );
+
+        // Record position for investor2
+        let amount2 = 3_000i128;
+        t.pool_client.record_position(
+            &marketplace,
+            &invoice_id,
+            &t.investor2,
+            &amount2,
+        );
+
+        // Get pool and verify total_funded = 8_000
+        let pool = t.pool_client.get_pool(&invoice_id);
+        assert_eq!(pool.total_funded, amount1 + amount2, "total_funded should be sum of all contributions");
+    }
+
+    #[test]
+    fn test_propose_early_settlement_rejects_below_total_funded() {
+        let t = setup();
+
+        let invoice_id = 1u64;
+        let marketplace = Address::generate(&t.env);
+
+        // Record positions totaling 10_000
+        let contrib_amount = 10_000i128;
+        t.pool_client.record_position(
+            &marketplace,
+            &invoice_id,
+            &t.investor1,
+            &contrib_amount,
+        );
+
+        // Release funds to create the pool
+        t.pool_client.release_funds(
+            &marketplace,
+            &invoice_id,
+            &12_000i128, // face_value
+            &t.sme,
+            &t.token,
+        );
+
+        // Attempting to propose early settlement below total_funded (10_000) should fail
+        let invalid_amount = 5_000i128;
+        let result = t.pool_client.try_propose_early_settlement(
+            &t.sme,
+            &invoice_id,
+            &invalid_amount,
+        );
+        assert!(result.is_err(), "Should reject settlement amount below total_funded");
+
+        // Attempting with exact total_funded should succeed
+        let valid_amount = 10_000i128;
+        let result = t.pool_client.try_propose_early_settlement(
+            &t.sme,
+            &invoice_id,
+            &valid_amount,
+        );
+        assert!(result.is_ok(), "Should accept settlement amount >= total_funded");
+    }
+
+    #[test]
+    fn test_total_funded_invariant_sum_of_positions() {
+        let t = setup();
+
+        let invoice_id = 1u64;
+        let marketplace = Address::generate(&t.env);
+
+        // Record multiple positions
+        let positions = vec![
+            (t.investor1.clone(), 2_000i128),
+            (t.investor2.clone(), 3_000i128),
+            (Address::generate(&t.env), 1_500i128),
+        ];
+
+        let mut expected_total = 0i128;
+        for (investor, amount) in positions {
+            t.pool_client.record_position(
+                &marketplace,
+                &invoice_id,
+                &investor,
+                &amount,
+            );
+            expected_total += amount;
+        }
+
+        let pool = t.pool_client.get_pool(&invoice_id);
+        assert_eq!(pool.total_funded, expected_total, "total_funded must equal sum of all Position.contributed");
+    }
+
+    #[test]
+    fn test_total_funded_not_double_counted_on_ownership_transfer() {
+        let t = setup();
+
+        let invoice_id = 1u64;
+        let marketplace = Address::generate(&t.env);
+
+        // Record position
+        let amount = 10_000i128;
+        t.pool_client.record_position(
+            &marketplace,
+            &invoice_id,
+            &t.investor1,
+            &amount,
+        );
+
+        let pool_before = t.pool_client.get_pool(&invoice_id);
+        let total_before = pool_before.total_funded;
+
+        // Simulate ownership transfer via buy_position
+        let new_owner = Address::generate(&t.env);
+        t.pool_client.buy_position(
+            &new_owner,
+            &invoice_id,
+            &t.investor1,
+            &amount,
+        );
+
+        let pool_after = t.pool_client.get_pool(&invoice_id);
+        let total_after = pool_after.total_funded;
+
+        // total_funded should NOT increase on transfer (not a new contribution)
+        assert_eq!(total_before, total_after, "total_funded must not be inflated by ownership transfers");
+    }
+
+    #[test]
+    fn test_propose_early_settlement_rejects_at_or_above_total_owed() {
+        let t = setup();
+
+        let invoice_id = 1u64;
+        let marketplace = Address::generate(&t.env);
+        let total_funded = 10_000i128;
+        let face_value = 12_000i128;
+
+        t.pool_client.record_position(
+            &marketplace,
+            &invoice_id,
+            &t.investor1,
+            &total_funded,
+        );
+
+        t.pool_client.release_funds(
+            &marketplace,
+            &invoice_id,
+            &face_value,
+            &t.sme,
+            &t.token,
+        );
+
+        // Attempt settlement at face_value should fail (amount >= total_owed)
+        let result = t.pool_client.try_propose_early_settlement(
+            &t.sme,
+            &invoice_id,
+            &face_value,
+        );
+        assert!(result.is_err(), "Should reject settlement amount >= total_owed");
+
+        // Attempt above face_value should also fail
+        let result = t.pool_client.try_propose_early_settlement(
+            &t.sme,
+            &invoice_id,
+            &(face_value + 1000i128),
+        );
+        assert!(result.is_err(), "Should reject settlement amount > total_owed");
+    }
 }
