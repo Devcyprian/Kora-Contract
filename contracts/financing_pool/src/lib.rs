@@ -2206,6 +2206,35 @@ mod tests {
         // TODO: Once is_invoice_frozen check is added, assert frozen state blocks the call.
         let _ = result;
     }
+
+    // ── Issue #476: InstallmentSchedule and EarlySettlement mutual exclusion ──
+
+    #[test]
+    fn test_set_installment_schedule_blocked_when_early_settlement_exists() {
+        let (env, admin, _nft, _treasury, _ac, client) = setup();
+        seed_pool(&env, &client.address, 1u64, 1000i128);
+        // This test documents that set_installment_schedule should reject if an
+        // EarlySettlement offer already exists for the same pool (issue #476).
+        // Currently, both can coexist, creating inconsistent state.
+        let sme = Address::generate(&env);
+        let result = client.try_set_installment_schedule(&admin, &1u64, &sme, &100i128, &10u64);
+        // TODO: Once mutual-exclusion check is added, this should verify that
+        // setting a schedule when an early settlement exists is rejected.
+        let _ = result;
+    }
+
+    #[test]
+    fn test_propose_early_settlement_blocked_when_schedule_exists() {
+        let (env, admin, _nft, _treasury, _ac, client) = setup();
+        seed_pool(&env, &client.address, 1u64, 1000i128);
+        // This test documents that propose_early_settlement should reject if an
+        // InstallmentSchedule already exists for the same pool (issue #476).
+        let sme = Address::generate(&env);
+        let result = client.try_propose_early_settlement(&sme, &1u64, &sme, &500i128);
+        // TODO: Once mutual-exclusion check is added, this should verify that
+        // proposing an early settlement when a schedule exists is rejected.
+        let _ = result;
+    }
 }
 
 #[cfg(test)]
