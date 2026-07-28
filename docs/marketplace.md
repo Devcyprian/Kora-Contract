@@ -294,4 +294,46 @@ Listings are stored in persistent storage with listing ID as key. Each listing i
 - **Initialize:** Set up marketplace with pointers to other contracts
 - **Whitelist Tokens:** Add tokens that SMEs and investors can use
 - **Pause Protocol:** Via access_control contract (pauses state-mutating operations)
-- **Set Fees:** Update the marketplace fee rate (future enhancement)
+- **Set Fees:** Update the marketplace fee rate
+
+## Authorization Model
+
+Privileged marketplace calls are gated on the multisig signer set configured in
+the `access_control` contract, not on a single admin key alone.
+
+Affected entrypoints: `set_fee_bps` / `update_fee_bps`, `set_tier_fee_bps`,
+`set_referrer_split_bps`, `whitelist_token`, `remove_token_whitelist`,
+`propose_upgrade`, and `execute_upgrade`.
+
+Two authorization paths exist:
+
+- **Direct admin call.** Allowed only when `access_control` has no multisig
+  configured, or has a 1-of-1 multisig. This is the backward-compatible path for
+  low-risk chains and existing deployments. When a quorum above 1 is configured,
+  these calls fail with `MultisigApprovalRequired`.
+- **Multisig quorum.** A configured signer calls `propose_admin_action(proposer,
+  action)` with a `MarketplaceAction`, other signers call
+  `approve_admin_action(approver, proposal_id)`, and once approvals reach the
+  configured threshold any signer calls `execute_admin_action(executor,
+  proposal_id)`. The proposal is marked executed before dispatch, so it cannot
+  be replayed.
+
+`is_multisig_required()` reports which path is currently in force, and
+`get_admin_proposal(proposal_id)` returns a proposal's action, approvals, and
+executed flag.
+
+`MarketplaceAction` variants: `SetFeeBps`, `SetReferrerSplitBps`,
+`SetTierFeeBps`, `WhitelistToken`, `RemoveTokenWhitelist`, `ProposeUpgrade`,
+`ExecuteUpgrade`.
+
+Relevant errors:
+
+| Error | Meaning |
+|---|---|
+| `MultisigApprovalRequired` | Direct admin call attempted while a quorum above 1 is configured |
+| `MultisigNotConfigured` | Proposal flow used with no multisig configured on access_control |
+| `NotMultisigSigner` | Caller is not in the configured signer set |
+| `GovernanceThresholdNotMet` | Approvals are below the configured threshold |
+| `AlreadyVoted` | Signer has already approved this proposal |
+| `ParameterProposalNotFound` | No proposal exists with the given id |
+| `ParameterProposalAlreadyExecuted` | Proposal has already been executed |

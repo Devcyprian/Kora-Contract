@@ -112,6 +112,7 @@ pub enum AdminActionType {
     InvoiceNftProposeUpgrade,
     InvoiceNftExecuteUpgrade,
     InvoiceNftMigrate,
+    InvoiceNftSetMintRateLimit,
 }
 
 /// A single entry in the on-chain admin audit log.

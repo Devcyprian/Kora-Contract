@@ -146,17 +146,13 @@ impl MarketplaceContract {
         Ok(())
     }
 
-    /// Update the referrer split fraction. Admin only.
+    /// Update the referrer split fraction. Admin only, and additionally subject
+    /// to multisig quorum when access_control has a threshold above 1.
     pub fn set_referrer_split_bps(env: Env, admin: Address, referrer_split_bps: u32) -> Result<(), KoraError> {
         admin.require_auth();
-        let mut config = Self::load_config(&env)?;
-        if config.admin != admin {
-            return Err(KoraError::NotAdmin);
-        }
-        require_valid_fee_bps(referrer_split_bps)?;
-        config.referrer_split_bps = referrer_split_bps;
-        env.storage().instance().set(&DataKey::Config, &config);
-        Ok(())
+        Self::require_admin(&env, &admin)?;
+        Self::require_direct_admin_allowed(&env)?;
+        Self::apply_set_referrer_split_bps(&env, referrer_split_bps)
     }
 
     /// Update the marketplace's local fallback fee. Admin only.
@@ -168,16 +164,9 @@ impl MarketplaceContract {
     /// set, or as an emergency lever if governance is unavailable. (#446)
     pub fn set_fee_bps(env: Env, admin: Address, fee_bps: u32) -> Result<(), KoraError> {
         admin.require_auth();
-        let mut config = Self::load_config(&env)?;
-        if config.admin != admin {
-            return Err(KoraError::NotAdmin);
-        }
-        require_valid_fee_bps(fee_bps)?;
-        let old_bps = config.fee_bps;
-        config.fee_bps = fee_bps;
-        env.storage().instance().set(&DataKey::Config, &config);
-        events::fee_rate_updated(&env, &admin, old_bps, fee_bps);
-        Ok(())
+        Self::require_admin(&env, &admin)?;
+        Self::require_direct_admin_allowed(&env)?;
+        Self::apply_set_fee_bps(&env, &admin, fee_bps)
     }
 
     /// Alias for set_fee_bps — backwards compatibility.
@@ -292,13 +281,9 @@ impl MarketplaceContract {
         fee_bps: u32,
     ) -> Result<(), KoraError> {
         admin.require_auth();
-        let config = Self::load_config(&env)?;
-        if config.admin != admin {
-            return Err(KoraError::NotAdmin);
-        }
-        require_valid_fee_bps(fee_bps)?;
-        env.storage().instance().set(&DataKey::TierFeeBps(Self::tier_ordinal(&tier)), &fee_bps);
-        Ok(())
+        Self::require_admin(&env, &admin)?;
+        Self::require_direct_admin_allowed(&env)?;
+        Self::apply_set_tier_fee_bps(&env, Self::tier_ordinal(&tier), fee_bps)
     }
 
     /// Get the fee for a specific risk tier (falls back to the flat/governance fee if no
@@ -1361,24 +1346,274 @@ impl MarketplaceContract {
         new_wasm_hash: BytesN<32>,
     ) -> Result<(), KoraError> {
         admin.require_auth();
-        let config = Self::load_config(&env)?;
-        if config.admin != admin {
-            return Err(KoraError::NotAdmin);
-        }
-        env.storage().instance().set(
-            &DataKey::UpgradeProposal,
-            &(new_wasm_hash.clone(), env.ledger().timestamp()),
-        );
-        events::upgrade_proposed(&env, &admin, &new_wasm_hash);
-        Ok(())
+        Self::require_admin(&env, &admin)?;
+        Self::require_direct_admin_allowed(&env)?;
+        Self::apply_propose_upgrade(&env, &admin, &new_wasm_hash)
     }
 
     pub fn execute_upgrade(env: Env, admin: Address) -> Result<(), KoraError> {
         admin.require_auth();
-        let config = Self::load_config(&env)?;
-        if config.admin != admin {
+        Self::require_admin(&env, &admin)?;
+        Self::require_direct_admin_allowed(&env)?;
+        Self::apply_execute_upgrade(&env, &admin)
+    }
+
+    // === Multisig-gated admin actions
+
+    /// Propose a privileged marketplace action for multisig approval.
+    ///
+    /// Gated by the signer set configured on the wired access_control contract,
+    /// so the marketplace inherits the protocol's existing M-of-N quorum rather
+    /// than trusting a single admin key.
+    ///
+    /// **Errors:**
+    /// - `KoraError::MultisigNotConfigured` — No multisig is configured on access_control.
+    /// - `KoraError::NotMultisigSigner` — `proposer` is not a configured signer.
+    pub fn propose_admin_action(
+        env: Env,
+        proposer: Address,
+        action: MarketplaceAction,
+    ) -> Result<u64, KoraError> {
+        proposer.require_auth();
+        let cfg = Self::require_multisig(&env)?;
+        Self::require_signer(&cfg, &proposer)?;
+
+        let id: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::NextAdminProposalId)
+            .unwrap_or(1);
+
+        let mut approvals: Vec<Address> = Vec::new(&env);
+        approvals.push_back(proposer);
+
+        let proposal = AdminProposal {
+            id,
+            action,
+            approvals,
+            executed: false,
+            created_at: env.ledger().timestamp(),
+        };
+        env.storage()
+            .persistent()
+            .set(&DataKey::AdminProposal(id), &proposal);
+        Self::bump_persistent(&env, &DataKey::AdminProposal(id));
+        env.storage().instance().set(
+            &DataKey::NextAdminProposalId,
+            &(id.checked_add(1).ok_or(KoraError::ArithmeticOverflow)?),
+        );
+        Ok(id)
+    }
+
+    /// Record an additional signer approval for a pending admin proposal.
+    pub fn approve_admin_action(
+        env: Env,
+        approver: Address,
+        proposal_id: u64,
+    ) -> Result<(), KoraError> {
+        approver.require_auth();
+        let cfg = Self::require_multisig(&env)?;
+        Self::require_signer(&cfg, &approver)?;
+
+        let mut proposal = Self::load_proposal(&env, proposal_id)?;
+        if proposal.executed {
+            return Err(KoraError::ParameterProposalAlreadyExecuted);
+        }
+        if proposal.approvals.contains(&approver) {
+            return Err(KoraError::AlreadyVoted);
+        }
+        proposal.approvals.push_back(approver);
+        env.storage()
+            .persistent()
+            .set(&DataKey::AdminProposal(proposal_id), &proposal);
+        Self::bump_persistent(&env, &DataKey::AdminProposal(proposal_id));
+        Ok(())
+    }
+
+    /// Execute an admin proposal once it has reached the multisig threshold.
+    ///
+    /// **Errors:**
+    /// - `KoraError::GovernanceThresholdNotMet` — Approvals are below the quorum.
+    pub fn execute_admin_action(
+        env: Env,
+        executor: Address,
+        proposal_id: u64,
+    ) -> Result<(), KoraError> {
+        executor.require_auth();
+        let cfg = Self::require_multisig(&env)?;
+        Self::require_signer(&cfg, &executor)?;
+
+        let mut proposal = Self::load_proposal(&env, proposal_id)?;
+        if proposal.executed {
+            return Err(KoraError::ParameterProposalAlreadyExecuted);
+        }
+        if proposal.approvals.len() < cfg.threshold {
+            return Err(KoraError::GovernanceThresholdNotMet);
+        }
+
+        // Mark executed before dispatching so a re-entrant path cannot replay it.
+        proposal.executed = true;
+        env.storage()
+            .persistent()
+            .set(&DataKey::AdminProposal(proposal_id), &proposal);
+
+        let admin = Self::load_config(&env)?.admin;
+        match proposal.action {
+            MarketplaceAction::SetFeeBps(bps) => Self::apply_set_fee_bps(&env, &admin, bps),
+            MarketplaceAction::SetReferrerSplitBps(bps) => {
+                Self::apply_set_referrer_split_bps(&env, bps)
+            }
+            MarketplaceAction::SetTierFeeBps(ordinal, bps) => {
+                Self::apply_set_tier_fee_bps(&env, ordinal, bps)
+            }
+            MarketplaceAction::WhitelistToken(token) => {
+                Self::apply_whitelist_token(&env, &admin, &token)
+            }
+            MarketplaceAction::RemoveTokenWhitelist(token) => {
+                Self::apply_remove_token_whitelist(&env, &token)
+            }
+            MarketplaceAction::ProposeUpgrade(hash) => {
+                Self::apply_propose_upgrade(&env, &admin, &hash)
+            }
+            MarketplaceAction::ExecuteUpgrade => Self::apply_execute_upgrade(&env, &admin),
+        }
+    }
+
+    /// Returns a pending or executed admin proposal by id.
+    pub fn get_admin_proposal(env: Env, proposal_id: u64) -> Result<AdminProposal, KoraError> {
+        Self::load_proposal(&env, proposal_id)
+    }
+
+    /// Returns true when privileged marketplace calls require a multisig quorum
+    /// rather than a direct admin call.
+    pub fn is_multisig_required(env: Env) -> bool {
+        matches!(Self::multisig_config(&env), Some(cfg) if cfg.threshold > 1)
+    }
+
+    // ── Private helpers ───────────────────────────────────────────────────────
+
+    // === Multisig helpers
+
+    /// Read the multisig config from the wired access_control contract.
+    ///
+    /// Returns `None` when no access_control contract is wired (unit-test
+    /// environments) or when no multisig has been configured on it.
+    fn multisig_config(env: &Env) -> Option<MultisigConfig> {
+        let ac_contract: Address = env.storage().instance().get(&DataKey::AccessControl)?;
+        let ac = kora_access_control::AccessControlContractClient::new(env, &ac_contract);
+        match ac.try_get_multisig_config() {
+            Ok(Ok(cfg)) => Some(cfg),
+            _ => None,
+        }
+    }
+
+    fn require_multisig(env: &Env) -> Result<MultisigConfig, KoraError> {
+        Self::multisig_config(env).ok_or(KoraError::MultisigNotConfigured)
+    }
+
+    fn require_signer(cfg: &MultisigConfig, who: &Address) -> Result<(), KoraError> {
+        if cfg.signers.contains(who) {
+            Ok(())
+        } else {
+            Err(KoraError::NotMultisigSigner)
+        }
+    }
+
+    /// Reject a direct single-key admin call when a real quorum is configured.
+    ///
+    /// Chains with no multisig, or a 1-of-1 multisig, keep the previous
+    /// single-admin behaviour, which is the migration path for existing
+    /// deployments.
+    fn require_direct_admin_allowed(env: &Env) -> Result<(), KoraError> {
+        match Self::multisig_config(env) {
+            Some(cfg) if cfg.threshold > 1 => Err(KoraError::MultisigApprovalRequired),
+            _ => Ok(()),
+        }
+    }
+
+    fn require_admin(env: &Env, admin: &Address) -> Result<(), KoraError> {
+        if Self::load_config(env)?.admin != *admin {
             return Err(KoraError::NotAdmin);
         }
+        Ok(())
+    }
+
+    fn load_proposal(env: &Env, proposal_id: u64) -> Result<AdminProposal, KoraError> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::AdminProposal(proposal_id))
+            .ok_or(KoraError::ParameterProposalNotFound)
+    }
+
+    // === Privileged action bodies
+    //
+    // Shared by the direct-admin entrypoints and by execute_admin_action, so
+    // both authorization paths enact byte-identical state changes.
+
+    fn apply_set_fee_bps(env: &Env, admin: &Address, fee_bps: u32) -> Result<(), KoraError> {
+        require_valid_fee_bps(fee_bps)?;
+        let mut config = Self::load_config(env)?;
+        let old_bps = config.fee_bps;
+        config.fee_bps = fee_bps;
+        env.storage().instance().set(&DataKey::Config, &config);
+        events::fee_rate_updated(env, admin, old_bps, fee_bps);
+        Ok(())
+    }
+
+    fn apply_set_referrer_split_bps(env: &Env, bps: u32) -> Result<(), KoraError> {
+        require_valid_fee_bps(bps)?;
+        let mut config = Self::load_config(env)?;
+        config.referrer_split_bps = bps;
+        env.storage().instance().set(&DataKey::Config, &config);
+        Ok(())
+    }
+
+    fn apply_set_tier_fee_bps(env: &Env, ordinal: u32, fee_bps: u32) -> Result<(), KoraError> {
+        require_valid_fee_bps(fee_bps)?;
+        env.storage()
+            .instance()
+            .set(&DataKey::TierFeeBps(ordinal), &fee_bps);
+        Ok(())
+    }
+
+    fn apply_whitelist_token(env: &Env, admin: &Address, token: &Address) -> Result<(), KoraError> {
+        env.storage()
+            .persistent()
+            .set(&DataKey::WhitelistedToken(token.clone()), &true);
+        Self::bump_persistent(env, &DataKey::WhitelistedToken(token.clone()));
+        events::token_whitelisted(env, admin, token);
+        Ok(())
+    }
+
+    fn apply_remove_token_whitelist(env: &Env, token: &Address) -> Result<(), KoraError> {
+        if !env
+            .storage()
+            .persistent()
+            .get::<_, bool>(&DataKey::WhitelistedToken(token.clone()))
+            .unwrap_or(false)
+        {
+            return Err(KoraError::TokenNotWhitelisted);
+        }
+        env.storage()
+            .persistent()
+            .remove(&DataKey::WhitelistedToken(token.clone()));
+        Ok(())
+    }
+
+    fn apply_propose_upgrade(
+        env: &Env,
+        admin: &Address,
+        new_wasm_hash: &BytesN<32>,
+    ) -> Result<(), KoraError> {
+        env.storage().instance().set(
+            &DataKey::UpgradeProposal,
+            &(new_wasm_hash.clone(), env.ledger().timestamp()),
+        );
+        events::upgrade_proposed(env, admin, new_wasm_hash);
+        Ok(())
+    }
+
+    fn apply_execute_upgrade(env: &Env, admin: &Address) -> Result<(), KoraError> {
         let (wasm_hash, proposed_at): (BytesN<32>, u64) = env
             .storage()
             .instance()
@@ -1388,7 +1623,7 @@ impl MarketplaceContract {
             return Err(KoraError::UpgradeTimelockNotElapsed);
         }
         env.storage().instance().remove(&DataKey::UpgradeProposal);
-        events::upgrade_executed(&env, &admin, &wasm_hash);
+        events::upgrade_executed(env, admin, &wasm_hash);
         env.deployer().update_current_contract_wasm(wasm_hash);
         Ok(())
     }
@@ -1671,12 +1906,15 @@ mod tests {
         env: Env,
         admin: Address,
         token: Address,
+        /// Issuer of `token`, used to mint test balances to investors.
+        token_admin: Address,
         seller: Address,
         treasury: Address,
         pool: Address,
         registry: Address,
         mp: MarketplaceContractClient<'static>,
         nft: InvoiceNftContractClient<'static>,
+        ac: kora_access_control::AccessControlContractClient<'static>,
     }
 
     fn deploy() -> TestEnv {
@@ -1697,6 +1935,12 @@ mod tests {
         let admin = Address::generate(&env);
         let treasury = Address::generate(&env);
 
+        // A real access_control contract, so pause checks and the multisig
+        // authorization gate exercise actual cross-contract behaviour.
+        let ac_id = env.register_contract(None, kora_access_control::AccessControlContract);
+        let ac = kora_access_control::AccessControlContractClient::new(&env, &ac_id);
+        ac.initialize(&admin);
+
         let nft_id = env.register_contract(None, InvoiceNftContract);
         let nft = InvoiceNftContractClient::new(&env, &nft_id);
         nft.initialize(&admin, &ac_id);
@@ -1713,7 +1957,6 @@ mod tests {
         let staking_token = Address::generate(&env);
         registry_client.initialize(&admin, &nft_id, &staking_token, &1_000_000i128, &5_000u32);
 
-        let mp_ac = Address::generate(&env);
         let mp_id = env.register_contract(None, MarketplaceContract);
         let mp = MarketplaceContractClient::new(&env, &mp_id);
         mp.initialize(&admin, &nft_id, &pool_id, &treasury, &mp_ac, &registry, &50u32, &0u32);
@@ -1737,7 +1980,28 @@ mod tests {
 
         let seller = Address::generate(&env);
 
-        TestEnv { env, admin, token, seller, treasury, pool: pool_id, registry, mp, nft }
+        TestEnv {
+            env,
+            admin,
+            token,
+            token_admin,
+            seller,
+            treasury,
+            pool: pool_id,
+            registry,
+            mp,
+            nft,
+            ac,
+        }
+    }
+
+    /// Mint `amount` of the test token to `to`.
+    fn mint_to(t: &TestEnv, to: &Address, amount: i128) {
+        soroban_sdk::token::StellarAssetClient::new(&t.env, &t.token).mint(to, &amount);
+    }
+
+    fn balance_of(t: &TestEnv, who: &Address) -> i128 {
+        soroban_sdk::token::Client::new(&t.env, &t.token).balance(who)
     }
 
     /// Mint an invoice in the NFT contract and return its id.
@@ -2691,12 +2955,210 @@ mod tests {
         // amount = 10_000_000 → fee = 50_000
         // referral_fee = 50_000 * 2000 / 10_000 = 10_000
         // treasury_fee = 50_000 - 10_000 = 40_000
+        // net to financing pool = 10_000_000 - 50_000 = 9_950_000
         let t = deploy();
         t.mp.set_referrer_split_bps(&t.admin, &2_000u32);
         let referrer = Address::generate(&t.env);
-        let id = list_with_referrer(&t, Some(referrer));
+        let id = list_with_referrer(&t, Some(referrer.clone()));
         let investor = Address::generate(&t.env);
-        assert!(t.mp.try_fund_invoice(&investor, &id, &10_000_000i128).is_ok());
+        mint_to(&t, &investor, 10_000_000i128);
+
+        t.mp.fund_invoice(&investor, &id, &10_000_000i128);
+
+        assert_eq!(balance_of(&t, &referrer), 10_000i128);
+        assert_eq!(balance_of(&t, &t.treasury), 40_000i128);
+        assert_eq!(balance_of(&t, &t.pool), 9_950_000i128);
+        assert_eq!(balance_of(&t, &investor), 0i128);
+    }
+
+    #[test]
+    fn test_fund_invoice_without_referrer_sends_full_fee_to_treasury() {
+        let t = deploy();
+        t.mp.set_referrer_split_bps(&t.admin, &2_000u32);
+        let id = list_with_referrer(&t, None);
+        let investor = Address::generate(&t.env);
+        mint_to(&t, &investor, 10_000_000i128);
+
+        t.mp.fund_invoice(&investor, &id, &10_000_000i128);
+
+        assert_eq!(balance_of(&t, &t.treasury), 50_000i128);
+        assert_eq!(balance_of(&t, &t.pool), 9_950_000i128);
+    }
+
+    #[test]
+    fn test_fund_invoice_referrer_unpaid_when_split_is_zero() {
+        // referrer_split_bps defaults to 0, so a stored referrer earns nothing.
+        let t = deploy();
+        let referrer = Address::generate(&t.env);
+        let id = list_with_referrer(&t, Some(referrer.clone()));
+        let investor = Address::generate(&t.env);
+        mint_to(&t, &investor, 10_000_000i128);
+
+        t.mp.fund_invoice(&investor, &id, &10_000_000i128);
+
+        assert_eq!(balance_of(&t, &referrer), 0i128);
+        assert_eq!(balance_of(&t, &t.treasury), 50_000i128);
+    }
+
+    // === Multisig-gated admin authorization
+
+    /// Configure an N-of-M multisig on the wired access_control contract.
+    fn configure_multisig(t: &TestEnv, signers: &[Address], threshold: u32) {
+        let mut v: Vec<Address> = Vec::new(&t.env);
+        for s in signers {
+            v.push_back(s.clone());
+        }
+        t.ac.configure_multisig(&t.admin, &v, &threshold);
+    }
+
+    #[test]
+    fn test_single_admin_still_works_without_multisig() {
+        let t = deploy();
+        assert!(!t.mp.is_multisig_required());
+        t.mp.set_fee_bps(&t.admin, &75u32);
+        assert_eq!(t.mp.get_fee_bps(), 75u32);
+    }
+
+    #[test]
+    fn test_single_admin_still_works_with_one_of_one_multisig() {
+        let t = deploy();
+        let signer = Address::generate(&t.env);
+        configure_multisig(&t, &[signer], 1);
+        assert!(!t.mp.is_multisig_required());
+        t.mp.set_fee_bps(&t.admin, &75u32);
+        assert_eq!(t.mp.get_fee_bps(), 75u32);
+    }
+
+    #[test]
+    fn test_direct_admin_calls_rejected_under_quorum() {
+        let t = deploy();
+        let s1 = Address::generate(&t.env);
+        let s2 = Address::generate(&t.env);
+        let s3 = Address::generate(&t.env);
+        configure_multisig(&t, &[s1, s2, s3], 2);
+        assert!(t.mp.is_multisig_required());
+
+        let token = Address::generate(&t.env);
+        assert_eq!(
+            t.mp.try_set_fee_bps(&t.admin, &9_000u32).unwrap_err().unwrap(),
+            KoraError::MultisigApprovalRequired
+        );
+        assert_eq!(
+            t.mp.try_whitelist_token(&t.admin, &token).unwrap_err().unwrap(),
+            KoraError::MultisigApprovalRequired
+        );
+        assert_eq!(
+            t.mp.try_remove_token_whitelist(&t.admin, &t.token).unwrap_err().unwrap(),
+            KoraError::MultisigApprovalRequired
+        );
+        assert_eq!(
+            t.mp.try_execute_upgrade(&t.admin).unwrap_err().unwrap(),
+            KoraError::MultisigApprovalRequired
+        );
+        // Fee is unchanged by the rejected call.
+        assert_eq!(t.mp.get_fee_bps(), 50u32);
+    }
+
+    #[test]
+    fn test_single_signer_cannot_execute_alone() {
+        let t = deploy();
+        let s1 = Address::generate(&t.env);
+        let s2 = Address::generate(&t.env);
+        let s3 = Address::generate(&t.env);
+        configure_multisig(&t, &[s1.clone(), s2, s3], 2);
+
+        let id = t.mp.propose_admin_action(&s1, &MarketplaceAction::SetFeeBps(75));
+        assert_eq!(
+            t.mp.try_execute_admin_action(&s1, &id).unwrap_err().unwrap(),
+            KoraError::GovernanceThresholdNotMet
+        );
+        assert_eq!(t.mp.get_fee_bps(), 50u32);
+    }
+
+    #[test]
+    fn test_non_signer_cannot_propose() {
+        let t = deploy();
+        let s1 = Address::generate(&t.env);
+        let s2 = Address::generate(&t.env);
+        configure_multisig(&t, &[s1, s2], 2);
+
+        let stranger = Address::generate(&t.env);
+        assert_eq!(
+            t.mp
+                .try_propose_admin_action(&stranger, &MarketplaceAction::SetFeeBps(75))
+                .unwrap_err()
+                .unwrap(),
+            KoraError::NotMultisigSigner
+        );
+    }
+
+    #[test]
+    fn test_quorum_approved_fee_change_succeeds() {
+        let t = deploy();
+        let s1 = Address::generate(&t.env);
+        let s2 = Address::generate(&t.env);
+        let s3 = Address::generate(&t.env);
+        configure_multisig(&t, &[s1.clone(), s2.clone(), s3], 2);
+
+        let id = t.mp.propose_admin_action(&s1, &MarketplaceAction::SetFeeBps(75));
+        t.mp.approve_admin_action(&s2, &id);
+        t.mp.execute_admin_action(&s2, &id);
+
+        assert_eq!(t.mp.get_fee_bps(), 75u32);
+        assert!(t.mp.get_admin_proposal(&id).executed);
+    }
+
+    #[test]
+    fn test_quorum_approved_token_whitelist_succeeds() {
+        let t = deploy();
+        let s1 = Address::generate(&t.env);
+        let s2 = Address::generate(&t.env);
+        configure_multisig(&t, &[s1.clone(), s2.clone()], 2);
+
+        let token = Address::generate(&t.env);
+        let id = t
+            .mp
+            .propose_admin_action(&s1, &MarketplaceAction::WhitelistToken(token.clone()));
+        t.mp.approve_admin_action(&s2, &id);
+        t.mp.execute_admin_action(&s1, &id);
+        assert!(t.mp.is_token_whitelisted(&token));
+
+        let id2 = t
+            .mp
+            .propose_admin_action(&s1, &MarketplaceAction::RemoveTokenWhitelist(token.clone()));
+        t.mp.approve_admin_action(&s2, &id2);
+        t.mp.execute_admin_action(&s1, &id2);
+        assert!(!t.mp.is_token_whitelisted(&token));
+    }
+
+    #[test]
+    fn test_admin_proposal_cannot_be_executed_twice() {
+        let t = deploy();
+        let s1 = Address::generate(&t.env);
+        let s2 = Address::generate(&t.env);
+        configure_multisig(&t, &[s1.clone(), s2.clone()], 2);
+
+        let id = t.mp.propose_admin_action(&s1, &MarketplaceAction::SetFeeBps(75));
+        t.mp.approve_admin_action(&s2, &id);
+        t.mp.execute_admin_action(&s1, &id);
+        assert_eq!(
+            t.mp.try_execute_admin_action(&s1, &id).unwrap_err().unwrap(),
+            KoraError::ParameterProposalAlreadyExecuted
+        );
+    }
+
+    #[test]
+    fn test_duplicate_approval_rejected() {
+        let t = deploy();
+        let s1 = Address::generate(&t.env);
+        let s2 = Address::generate(&t.env);
+        configure_multisig(&t, &[s1.clone(), s2], 2);
+
+        let id = t.mp.propose_admin_action(&s1, &MarketplaceAction::SetFeeBps(75));
+        assert_eq!(
+            t.mp.try_approve_admin_action(&s1, &id).unwrap_err().unwrap(),
+            KoraError::AlreadyVoted
+        );
     }
 
     #[test]

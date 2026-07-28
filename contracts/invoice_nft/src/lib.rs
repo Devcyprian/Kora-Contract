@@ -162,6 +162,11 @@ pub struct MetadataDispute {
     SmeInvoiceIds(Address),
     /// Instance key: monotonic counter allocating the next batch-mint correlation ID.
     NextBatchId,
+    /// Instance key: `MintRateLimit` config. Absent means minting is unthrottled,
+    /// preserving pre-existing behaviour for deployments that never configure it.
+    MintRateLimit,
+    /// Persistent: `(window_start_ts, mints_used)` rolling mint window for an SME.
+    SmeMintWindow(Address),
     // ── Admin audit log ───────────────────────────────────────────────────────
     /// Next write position in the admin audit ring buffer (0..MAX_AUDIT_LOG_SIZE).
     AuditLogHead,
@@ -169,6 +174,14 @@ pub struct MetadataDispute {
     AuditLogTotal,
     /// An admin audit log entry at ring-buffer position `n`.
     AuditEntry(u64),
+}
+
+/// Per-SME minting velocity cap: at most `max_mints` invoices per `window_secs`.
+#[contracttype]
+#[derive(Clone)]
+pub struct MintRateLimit {
+    pub max_mints: u32,
+    pub window_secs: u64,
 }
 
 /// Input type for a single invoice within a batch mint operation.
@@ -365,6 +378,12 @@ impl InvoiceNftContract {
 
     /// Set the authorized marketplace and financing pool contract addresses.
     /// Must be called by admin after deployment to enable status transitions.
+    ///
+    /// **Errors:**
+    /// - `KoraError::NotAdmin` — Caller is not the admin.
+    /// - `KoraError::InvalidAddress` — Either address is this contract, they are
+    ///   identical to each other, or either collides with the stored admin,
+    ///   access_control, or risk_registry address.
     pub fn set_authorized_callers(
         env: Env,
         admin: Address,
@@ -373,6 +392,19 @@ impl InvoiceNftContract {
     ) -> Result<(), InvoiceNftError> {
         admin.require_auth();
         Self::require_admin(&env, &admin)?;
+        kora_shared::validation::require_not_self(&env, &marketplace)?;
+        kora_shared::validation::require_not_self(&env, &financing_pool)?;
+        kora_shared::validation::require_distinct(&marketplace, &financing_pool)?;
+
+        // Neither role may collide with an existing privileged/wired address:
+        // doing so would let one key satisfy two authorization paths at once.
+        for wired in [DataKey::Admin, DataKey::AccessControl, DataKey::RiskRegistry] {
+            if let Some(existing) = env.storage().instance().get::<DataKey, Address>(&wired) {
+                kora_shared::validation::require_distinct(&marketplace, &existing)?;
+                kora_shared::validation::require_distinct(&financing_pool, &existing)?;
+            }
+        }
+
         env.storage().instance().set(&DataKey::Marketplace, &marketplace);
         env.storage().instance().set(&DataKey::FinancingPool, &financing_pool);
         Self::append_audit_entry(&env, &admin, AdminActionType::InvoiceNftSetAuthorizedCallers);
@@ -586,6 +618,10 @@ impl InvoiceNftContract {
             require_non_empty_string(&entry.ipfs_cid)?;
             require_max_length_string(&entry.ipfs_cid, MAX_IPFS_CID_LEN)?;
         }
+
+        // Charged once for the whole batch, but at N units, so a batch cannot be
+        // used to sidestep the per-invoice velocity cap.
+        Self::consume_mint_quota(&env, &sme, invoices.len())?;
 
         // ── Phase 2: mint each invoice ────────────────────────────────────────
         let mut ids: Vec<u64> = Vec::new(&env);
@@ -3380,6 +3416,213 @@ mod tests {
         let page1 = client.get_audit_log(&1u32, &2u32);
         assert_eq!(page1.len(), 1);
         assert_eq!(page1.get(0).unwrap().action, AdminActionType::InvoiceNftSetRiskRegistry);
+    }
+
+    // === set_authorized_callers validation
+
+    #[test]
+    fn test_set_authorized_callers_valid_pair_succeeds() {
+        let (env, admin, client) = setup();
+        let marketplace = Address::generate(&env);
+        let pool = Address::generate(&env);
+        client.set_authorized_callers(&admin, &marketplace, &pool);
+    }
+
+    #[test]
+    fn test_set_authorized_callers_identical_addresses_rejected() {
+        let (env, admin, client) = setup();
+        let same = Address::generate(&env);
+        let result = client.try_set_authorized_callers(&admin, &same, &same);
+        assert_eq!(result.unwrap_err().unwrap(), KoraError::InvalidAddress);
+    }
+
+    #[test]
+    fn test_set_authorized_callers_self_as_marketplace_rejected() {
+        let (env, admin, client) = setup();
+        let contract_id = client.address.clone();
+        let pool = Address::generate(&env);
+        let result = client.try_set_authorized_callers(&admin, &contract_id, &pool);
+        assert_eq!(result.unwrap_err().unwrap(), KoraError::InvalidAddress);
+    }
+
+    #[test]
+    fn test_set_authorized_callers_self_as_financing_pool_rejected() {
+        let (env, admin, client) = setup();
+        let contract_id = client.address.clone();
+        let marketplace = Address::generate(&env);
+        let result = client.try_set_authorized_callers(&admin, &marketplace, &contract_id);
+        assert_eq!(result.unwrap_err().unwrap(), KoraError::InvalidAddress);
+    }
+
+    #[test]
+    fn test_set_authorized_callers_collision_with_admin_rejected() {
+        let (env, admin, client) = setup();
+        let pool = Address::generate(&env);
+        let result = client.try_set_authorized_callers(&admin, &admin, &pool);
+        assert_eq!(result.unwrap_err().unwrap(), KoraError::InvalidAddress);
+    }
+
+    // === per-SME mint rate limiting
+
+    fn mint_for(env: &Env, client: &InvoiceNftContractClient, sme: &Address) -> u64 {
+        client.mint_invoice(
+            sme,
+            &Bytes::from_slice(env, &[1u8; 32]),
+            &1_000_000_000i128,
+            &Symbol::new(env, "USDC"),
+            &(env.ledger().timestamp() + 86_400 * 30),
+            &String::from_str(
+                env,
+                "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi",
+            ),
+            &50u32,
+            &None,
+        )
+    }
+
+    /// Attempt a mint that is expected to fail, returning the contract error.
+    fn mint_err(env: &Env, client: &InvoiceNftContractClient, sme: &Address) -> KoraError {
+        client
+            .try_mint_invoice(
+                sme,
+                &Bytes::from_slice(env, &[1u8; 32]),
+                &1_000_000_000i128,
+                &Symbol::new(env, "USDC"),
+                &(env.ledger().timestamp() + 86_400 * 30),
+                &String::from_str(
+                    env,
+                    "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi",
+                ),
+                &50u32,
+                &None,
+            )
+            .unwrap_err()
+            .unwrap()
+    }
+
+    fn batch_input(env: &Env) -> BatchInvoiceInput {
+        BatchInvoiceInput {
+            debtor_hash: Bytes::from_slice(env, &[1u8; 32]),
+            amount: 1_000_000_000i128,
+            currency: Symbol::new(env, "USDC"),
+            due_date: env.ledger().timestamp() + 86_400 * 30,
+            ipfs_cid: String::from_str(
+                env,
+                "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi",
+            ),
+            risk_score: 50,
+            notes: None,
+        }
+    }
+
+    fn advance(env: &Env, secs: u64) {
+        let ts = env.ledger().timestamp();
+        env.ledger().set_timestamp(ts + secs);
+    }
+
+    #[test]
+    fn test_mint_unthrottled_when_rate_limit_unset() {
+        let (env, _admin, client) = setup();
+        let sme = Address::generate(&env);
+        assert!(client.get_mint_rate_limit().is_none());
+        for _ in 0..5 {
+            mint_for(&env, &client, &sme);
+        }
+    }
+
+    #[test]
+    fn test_set_mint_rate_limit_rejects_zero_values() {
+        let (_env, admin, client) = setup();
+        assert_eq!(
+            client.try_set_mint_rate_limit(&admin, &0u32, &3600u64).unwrap_err().unwrap(),
+            KoraError::InvalidParameterValue
+        );
+        assert_eq!(
+            client.try_set_mint_rate_limit(&admin, &3u32, &0u64).unwrap_err().unwrap(),
+            KoraError::InvalidParameterValue
+        );
+    }
+
+    #[test]
+    fn test_mint_rate_limit_blocks_then_recovers_after_window() {
+        let (env, admin, client) = setup();
+        client.set_mint_rate_limit(&admin, &3u32, &3600u64);
+        let sme = Address::generate(&env);
+
+        for _ in 0..3 {
+            mint_for(&env, &client, &sme);
+        }
+        assert_eq!(
+            mint_err(&env, &client, &sme),
+            KoraError::MintRateLimitExceeded
+        );
+
+        advance(&env, 3600);
+        mint_for(&env, &client, &sme);
+        assert_eq!(client.get_sme_mint_window(&sme).1, 1u32);
+    }
+
+    #[test]
+    fn test_mint_rate_limit_is_per_sme() {
+        let (env, admin, client) = setup();
+        client.set_mint_rate_limit(&admin, &1u32, &3600u64);
+        let sme_a = Address::generate(&env);
+        let sme_b = Address::generate(&env);
+
+        mint_for(&env, &client, &sme_a);
+        assert_eq!(
+            mint_err(&env, &client, &sme_a),
+            KoraError::MintRateLimitExceeded
+        );
+        mint_for(&env, &client, &sme_b);
+    }
+
+    #[test]
+    fn test_batch_mint_counts_each_invoice_against_window() {
+        let (env, admin, client) = setup();
+        client.set_mint_rate_limit(&admin, &3u32, &3600u64);
+        let sme = Address::generate(&env);
+
+        let mut batch: Vec<BatchInvoiceInput> = Vec::new(&env);
+        for _ in 0..3 {
+            batch.push_back(batch_input(&env));
+        }
+        client.mint_invoices_batch(&sme, &batch);
+        assert_eq!(client.get_sme_mint_window(&sme).1, 3u32);
+
+        // A single further mint must now be rejected, proving the batch was
+        // charged per invoice rather than as one call.
+        assert_eq!(
+            mint_err(&env, &client, &sme),
+            KoraError::MintRateLimitExceeded
+        );
+    }
+
+    #[test]
+    fn test_batch_mint_exceeding_limit_is_rejected_atomically() {
+        let (env, admin, client) = setup();
+        client.set_mint_rate_limit(&admin, &2u32, &3600u64);
+        let sme = Address::generate(&env);
+
+        let mut batch: Vec<BatchInvoiceInput> = Vec::new(&env);
+        for _ in 0..3 {
+            batch.push_back(batch_input(&env));
+        }
+        assert_eq!(
+            client.try_mint_invoices_batch(&sme, &batch).unwrap_err().unwrap(),
+            KoraError::MintRateLimitExceeded
+        );
+        assert_eq!(client.get_sme_invoice_ids(&sme, &0u32, &10u32).len(), 0);
+    }
+
+    #[test]
+    fn test_set_authorized_callers_collision_with_risk_registry_rejected() {
+        let (env, admin, client) = setup();
+        let rr = Address::generate(&env);
+        client.set_risk_registry(&admin, &rr);
+        let marketplace = Address::generate(&env);
+        let result = client.try_set_authorized_callers(&admin, &marketplace, &rr);
+        assert_eq!(result.unwrap_err().unwrap(), KoraError::InvalidAddress);
     }
 }
 #![no_std]
