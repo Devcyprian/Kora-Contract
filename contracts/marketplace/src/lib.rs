@@ -30,6 +30,7 @@ pub enum DataKey {
     FinancingPool,
     Treasury,
     AccessControl,
+    PriceOracle,
     FeeBps,
     RiskRegistry,
     Listing(u64),
@@ -77,6 +78,7 @@ pub struct MarketplaceConfig {
     pub financing_pool: Address,
     pub treasury: Address,
     pub access_control: Address,
+    pub price_oracle: Address,
     pub risk_registry: Address,
     pub fee_bps: u32,
     /// Fraction of the collected fee that goes to the referrer (0 = no split).
@@ -112,6 +114,7 @@ impl MarketplaceContract {
         financing_pool: Address,
         treasury: Address,
         access_control: Address,
+        price_oracle: Address,
         risk_registry: Address,
         fee_bps: u32,
         referrer_split_bps: u32,
@@ -126,12 +129,14 @@ impl MarketplaceContract {
         env.storage().instance().set(&DataKey::Treasury, &treasury);
         env.storage().instance().set(&DataKey::FeeBps, &fee_bps);
         env.storage().instance().set(&DataKey::AccessControl, &access_control);
+        env.storage().instance().set(&DataKey::PriceOracle, &price_oracle);
         let config = MarketplaceConfig {
             admin,
             invoice_nft,
             financing_pool,
             treasury,
             access_control,
+            price_oracle,
             risk_registry,
             fee_bps,
             // No referrer split at initialization; configure via set_referrer_split_bps.
@@ -646,8 +651,32 @@ impl MarketplaceContract {
             return Err(KoraError::FundingDeadlinePassed);
         }
 
+        let config = Self::load_config(&env)?;
+
+        // Early load of invoice to determine currency for conversion check
+        let nft_client = kora_invoice_nft::InvoiceNftContractClient::new(&env, &config.invoice_nft);
+        let invoice = nft_client.get_invoice(&invoice_id);
+
+        // Determine the amount that will be credited (after conversion if needed)
+        let token_client = token::Client::new(&env, &listing.token);
+        let token_decimals = token_client.decimals();
+        let token_symbol = token_client.symbol();
+        let credited_amount = if token_symbol != invoice.currency {
+            let oracle_client = kora_price_oracle::PriceOracleContractClient::new(&env, &config.price_oracle);
+            let invoice_decimals = 7u32;
+            oracle_client.convert_with_decimals(
+                &amount,
+                &token_symbol,
+                &invoice.currency,
+                &token_decimals,
+                &invoice_decimals,
+            )?
+        } else {
+            amount
+        };
+
         let remaining = safe_sub(listing.asking_price, listing.funded_amount)?;
-        if amount > remaining {
+        if credited_amount > remaining {
             return Err(KoraError::ExceedsFundingTarget);
         }
 
@@ -2812,6 +2841,7 @@ pub struct MarketplaceConfig {
     pub financing_pool: Address,
     pub treasury: Address,
     pub access_control: Address,
+    pub price_oracle: Address,
     pub risk_registry: Address,
     pub fee_bps: u32,
     /// Fraction of the collected fee that goes to the referrer (0 = no split).

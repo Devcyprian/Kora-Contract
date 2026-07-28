@@ -76,6 +76,15 @@ impl PriceOracleContract {
             return Err(PriceOracleError::InvalidAmount);
         }
 
+        // Check reciprocal consistency if reverse pair exists
+        if let Ok(reverse_data) = Self::get_price(env.clone(), quote.clone(), base.clone()) {
+            // Expected reciprocal: if P is forward price, reverse should be ~10^14 / P
+            // We compute the reciprocal and allow 1% tolerance for rounding
+            let expected_reciprocal = Self::compute_reciprocal(price)?;
+            let tolerance_bps = 100; // 1% = 100 basis points
+            Self::validate_reciprocal_tolerance(expected_reciprocal, reverse_data.price, tolerance_bps)?;
+        }
+
         let data = PriceData {
             price,
             timestamp: env.ledger().timestamp(),contracts/access_control/src/lib.rs￼Mark as resolved 
@@ -267,6 +276,83 @@ impl PriceOracleContract {
         env.storage().instance().remove(&DataKey::UpgradeProposal);
         env.deployer().update_current_contract_wasm(wasm_hash);
         Ok(())
+    }
+
+    /// Convert an amount between currencies with decimal precision correction.
+    /// Applies: amount_out = (amount_in * price_ratio / 1e7) * 10^(to_decimals - from_decimals)
+    /// This corrects for differing token decimal places (e.g., 6 vs 7 decimal tokens).
+    ///
+    /// **Parameters:**
+    /// - `amount` — The input amount in `from` currency's smallest unit.
+    /// - `from` — Source currency symbol.
+    /// - `to` — Target currency symbol.
+    /// - `from_decimals` — Decimal places of the `from` token (typically 6 or 7).
+    /// - `to_decimals` — Decimal places of the `to` token (typically 6 or 7).
+    ///
+    /// **Returns:** Converted amount in `to` currency's smallest unit.
+    ///
+    /// **Errors:**
+    /// - `PriceOracleError::ArithmeticOverflow` — Multiplication or division overflowed.
+    /// - `PriceOracleError::InvalidAmount` — Price not found, stale, or result is ≤ 0.
+    /// - `PriceOracleError::InvoiceExpired` — Price data is older than MAX_STALENESS_SECS.
+    pub fn convert_with_decimals(
+        env: Env,
+        amount: i128,
+        from: Symbol,
+        to: Symbol,
+        from_decimals: u32,
+        to_decimals: u32,
+    ) -> Result<i128, PriceOracleError> {
+        if from == to {
+            return Ok(amount);
+        }
+
+        let price_data = Self::get_price(env.clone(), from.clone(), to.clone())?;
+        // First: apply price ratio scaled by 1e7
+        let converted = amount
+            .checked_mul(price_data.price)
+            .and_then(|v| v.checked_div(10_000_000))
+            .ok_or(PriceOracleError::ArithmeticOverflow)?;
+
+        if converted <= 0 {
+            return Err(PriceOracleError::InvalidAmount);
+        }
+
+        // Second: apply decimal rescaling based on token precision differences
+        let rescaled = if from_decimals >= to_decimals {
+            let divisor = Self::compute_10_pow(from_decimals - to_decimals)?;
+            converted
+                .checked_div(divisor)
+                .ok_or(PriceOracleError::ArithmeticOverflow)?
+        } else {
+            let multiplier = Self::compute_10_pow(to_decimals - from_decimals)?;
+            converted
+                .checked_mul(multiplier)
+                .ok_or(PriceOracleError::ArithmeticOverflow)?
+        };
+
+        if rescaled <= 0 {
+            return Err(PriceOracleError::InvalidAmount);
+        }
+
+        Ok(rescaled)
+    }
+
+    fn compute_10_pow(exp: u32) -> Result<i128, PriceOracleError> {
+        match exp {
+            0 => Ok(1),
+            1 => Ok(10),
+            2 => Ok(100),
+            3 => Ok(1_000),
+            4 => Ok(10_000),
+            5 => Ok(100_000),
+            6 => Ok(1_000_000),
+            7 => Ok(10_000_000),
+            8 => Ok(100_000_000),
+            9 => Ok(1_000_000_000),
+            10 => Ok(10_000_000_000),
+            _ => Err(PriceOracleError::ArithmeticOverflow),
+        }
     }
 
     fn require_admin(env: &Env, caller: &Address) -> Result<(), PriceOracleError> {

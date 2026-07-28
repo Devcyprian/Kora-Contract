@@ -226,6 +226,42 @@ Once set, `withdraw` calls `require_not_paused()` and is rejected with `KoraErro
 
 ---
 
+## Cross-Currency Fee Valuation (Price Oracle Integration)
+
+As the protocol whitelists multiple stablecoins (e.g., USDC, EURC), the treasury can now calculate total fee revenue in a single common currency using the price oracle.
+
+### `set_price_oracle(admin, price_oracle)`
+
+Sets or updates the price oracle contract address. Optional — if not set, conversion-based views will return 0.
+
+- **Auth:** Admin only (`require_auth()`)
+- **Parameters:** `price_oracle` (Address)
+- **Returns:** None
+- **Errors:** `NotAdmin` if caller is not the admin
+
+### `get_total_collected_value(tokens, token_symbols, reference_currency, token_decimals, ref_decimals)`
+
+Aggregates collected fees across multiple tokens and converts them all to a single reference currency via the price oracle.
+
+- **Auth:** None (read-only view)
+- **Parameters:**
+  - `tokens` — Vec of token contract addresses
+  - `token_symbols` — Vec of token symbols (must match `tokens` length)
+  - `reference_currency` — Target symbol for valuation (e.g., "USDC")
+  - `token_decimals` — Vec of token decimal places (must match `tokens` length)
+  - `ref_decimals` — Decimal places of reference currency
+- **Returns:** Total collected fees in reference currency's smallest unit (i128)
+- **Behavior:**
+  - If no oracle is configured, returns 0
+  - If a price is unavailable for a token/reference pair, that token is skipped (graceful degradation)
+  - Conversions use `price_oracle.convert_with_decimals()` for decimal-aware math
+  - Overflow is saturated at `i128::MAX`
+- **Errors:** `InvalidAmount` if Vec lengths do not match
+
+**Note:** This function currently requires the caller to pass the list of tokens. Once issue #36 (token registry) is implemented, a simpler parameterless `get_total_collected_value(reference_currency)` will iterate all whitelisted tokens automatically.
+
+---
+
 ## Public API
 
 | Function | Auth | Description |
@@ -274,6 +310,7 @@ must go through the `propose_treasury_action` → `execute_treasury_action` flow
 |-----|------|------|-------------|
 | `Admin` | persistent | `Address` | Admin address |
 | `FeeBps` | persistent | `u32` | Protocol fee rate |
+| `PriceOracle` | persistent | `Address` | Price oracle contract (optional) |
 | `Collected(Address)` | persistent | `i128` | Cumulative fees per token |
 | `WhitelistedToken(Address)` | persistent | `bool` | Token whitelist flag |
 | `UpgradeProposal` | instance | `(BytesN<32>, u64)` | Pending upgrade hash + timestamp |
