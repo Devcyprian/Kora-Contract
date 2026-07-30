@@ -26,6 +26,9 @@ export const MAINNET: NetworkConfig = {
   networkPassphrase: Networks.PUBLIC,
 };
 
+const TRANSACTION_POLL_INTERVAL_MS = 1000;
+const TRANSACTION_POLL_TIMEOUT_MS = 30000;
+
 export class BaseClient {
   protected server: rpc.Server;
   protected contract: Contract;
@@ -66,10 +69,17 @@ export class BaseClient {
     prepared.sign(keypair);
     const response = await this.server.sendTransaction(prepared);
     if (response.status === "ERROR") throw new Error(JSON.stringify(response.errorResult));
-    // Poll for completion
+    // Poll for completion, bounded by a wall-clock deadline so a dropped
+    // transaction or an RPC outage can't hang callers indefinitely.
+    const deadline = Date.now() + TRANSACTION_POLL_TIMEOUT_MS;
     let getResponse = await this.server.getTransaction(response.hash);
     while (getResponse.status === rpc.Api.GetTransactionStatus.NOT_FOUND) {
-      await new Promise((r) => setTimeout(r, 1000));
+      if (Date.now() >= deadline) {
+        throw new Error(
+          `Timed out waiting for transaction ${response.hash} to be included after ${TRANSACTION_POLL_TIMEOUT_MS}ms`
+        );
+      }
+      await new Promise((r) => setTimeout(r, TRANSACTION_POLL_INTERVAL_MS));
       getResponse = await this.server.getTransaction(response.hash);
     }
     if (getResponse.status !== rpc.Api.GetTransactionStatus.SUCCESS) {
