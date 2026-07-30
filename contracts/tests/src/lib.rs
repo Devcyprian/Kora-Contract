@@ -13,6 +13,7 @@ mod integration {
     use kora_financing_pool::{FinancingPoolContract, FinancingPoolContractClient};
     use kora_invoice_nft::{InvoiceNftContract, InvoiceNftContractClient};
     use kora_marketplace::{MarketplaceContract, MarketplaceContractClient};
+    use kora_price_oracle::{PriceOracleContract, PriceOracleContractClient};
     use kora_risk_registry::{RiskRegistryContract, RiskRegistryContractClient};
     use kora_shared::types::InvoiceStatus;
     use kora_treasury::{TreasuryContract, TreasuryContractClient};
@@ -29,6 +30,7 @@ mod integration {
         pool: FinancingPoolContractClient<'a>,
         treasury: TreasuryContractClient<'a>,
         risk_registry: RiskRegistryContractClient<'a>,
+        price_oracle: PriceOracleContractClient<'a>,
         staking_token: Address,
     }
 
@@ -60,6 +62,7 @@ mod integration {
         let pool_id = env.register_contract(None, FinancingPoolContract);
         let treasury_id = env.register_contract(None, TreasuryContract);
         let rr_id = env.register_contract(None, RiskRegistryContract);
+        let oracle_id = env.register_contract(None, PriceOracleContract);
 
         let ac = AccessControlContractClient::new(&env, &ac_id);
         let nft = InvoiceNftContractClient::new(&env, &nft_id);
@@ -67,6 +70,7 @@ mod integration {
         let pool = FinancingPoolContractClient::new(&env, &pool_id);
         let treasury = TreasuryContractClient::new(&env, &treasury_id);
         let rr = RiskRegistryContractClient::new(&env, &rr_id);
+        let price_oracle = PriceOracleContractClient::new(&env, &oracle_id);
 
         // Real Stellar Asset Contract used as the risk_registry's verifier staking
         // token, so add_verifier's token transfer has a real contract to call.
@@ -78,12 +82,14 @@ mod integration {
         // Initialize all contracts
         ac.initialize(&admin);
         nft.initialize(&admin, &ac_id);
-        mp.initialize(&admin, &nft_id, &pool_id, &treasury_id, &ac_id, &rr_id, &50u32);
-        let oracle_addr = Address::generate(&env);
+        price_oracle.initialize(&admin, &ac_id);
         // max_position_bps = 10_000 (100%) — disables the per-investor concentration
         // cap so it doesn't interfere with tests that aren't exercising that guard.
         pool.initialize(
-            &admin, &nft_id, &rr_id, &treasury_id, &ac_id, &200u32, &oracle_addr, &10_000u32,
+            &admin, &nft_id, &rr_id, &treasury_id, &ac_id, &200u32, &oracle_id, &10_000u32,
+        );
+        mp.initialize(
+            &admin, &nft_id, &pool_id, &treasury_id, &ac_id, &oracle_id, &rr_id, &50u32, &0u32,
         );
         treasury.initialize(&admin, &50u32);
         rr.initialize(&admin, &nft_id, &staking_token, &1_000_000i128, &5_000u32);
@@ -100,6 +106,7 @@ mod integration {
             pool,
             treasury,
             risk_registry: rr,
+            price_oracle,
             staking_token,
         }
     }

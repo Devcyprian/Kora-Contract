@@ -62,14 +62,21 @@ mod marketplace_edge_cases {
         let pool_id = env.register_contract(None, kora_financing_pool::FinancingPoolContract);
         let pool_client = FinancingPoolContractClient::new(&env, &pool_id);
         let ac2 = Address::generate(&env);
-        let oracle = Address::generate(&env);
-        pool_client.initialize(&admin, &nft_id, &treasury, &ac2, &200u32, &oracle);
+        let risk_registry = Address::generate(&env);
+        let oracle_id = env.register_contract(None, kora_price_oracle::PriceOracleContract);
+        let oracle_client = kora_price_oracle::PriceOracleContractClient::new(&env, &oracle_id);
+        oracle_client.initialize(&admin, &ac2);
+        pool_client.initialize(
+            &admin, &nft_id, &risk_registry, &treasury, &ac2, &200u32, &oracle_id, &10_000u32,
+        );
 
         // Deploy Marketplace
         let mp_id = env.register_contract(None, kora_marketplace::MarketplaceContract);
         let mp = MarketplaceContractClient::new(&env, &mp_id);
         let mp_ac = Address::generate(&env);
-        mp.initialize(&admin, &nft_id, &pool_id, &treasury, &mp_ac, &50u32);
+        mp.initialize(
+            &admin, &nft_id, &pool_id, &treasury, &mp_ac, &oracle_id, &risk_registry, &50u32, &0u32,
+        );
 
         mp.whitelist_token(&admin, &token);
 
@@ -171,13 +178,20 @@ mod marketplace_edge_cases {
         let pool_id = env.register_contract(None, kora_financing_pool::FinancingPoolContract);
         let pool_client = FinancingPoolContractClient::new(&env, &pool_id);
         let ac2 = Address::generate(&env);
-        let oracle = Address::generate(&env);
-        pool_client.initialize(&admin, &nft_id, &treasury, &ac2, &200u32, &oracle);
+        let risk_registry = Address::generate(&env);
+        let oracle_id = env.register_contract(None, kora_price_oracle::PriceOracleContract);
+        let oracle_client = kora_price_oracle::PriceOracleContractClient::new(&env, &oracle_id);
+        oracle_client.initialize(&admin, &ac2);
+        pool_client.initialize(
+            &admin, &nft_id, &risk_registry, &treasury, &ac2, &200u32, &oracle_id, &10_000u32,
+        );
 
         let mp_id = env.register_contract(None, kora_marketplace::MarketplaceContract);
         let mp = MarketplaceContractClient::new(&env, &mp_id);
         let mp_ac = Address::generate(&env);
-        mp.initialize(&admin, &nft_id, &pool_id, &treasury, &mp_ac, &0u32); // 0 fee
+        mp.initialize(
+            &admin, &nft_id, &pool_id, &treasury, &mp_ac, &oracle_id, &risk_registry, &0u32, &0u32,
+        ); // 0 fee
 
         mp.whitelist_token(&admin, &token);
 
@@ -224,13 +238,20 @@ mod marketplace_edge_cases {
         let pool_id = env.register_contract(None, kora_financing_pool::FinancingPoolContract);
         let pool_client = FinancingPoolContractClient::new(&env, &pool_id);
         let ac2 = Address::generate(&env);
-        let oracle = Address::generate(&env);
-        pool_client.initialize(&admin, &nft_id, &treasury, &ac2, &200u32, &oracle);
+        let risk_registry = Address::generate(&env);
+        let oracle_id = env.register_contract(None, kora_price_oracle::PriceOracleContract);
+        let oracle_client = kora_price_oracle::PriceOracleContractClient::new(&env, &oracle_id);
+        oracle_client.initialize(&admin, &ac2);
+        pool_client.initialize(
+            &admin, &nft_id, &risk_registry, &treasury, &ac2, &200u32, &oracle_id, &10_000u32,
+        );
 
         let mp_id = env.register_contract(None, kora_marketplace::MarketplaceContract);
         let mp = MarketplaceContractClient::new(&env, &mp_id);
         let mp_ac = Address::generate(&env);
-        mp.initialize(&admin, &nft_id, &pool_id, &treasury, &mp_ac, &10_000u32); // 100% fee
+        mp.initialize(
+            &admin, &nft_id, &pool_id, &treasury, &mp_ac, &oracle_id, &risk_registry, &10_000u32, &0u32,
+        ); // 100% fee
 
         mp.whitelist_token(&admin, &token);
 

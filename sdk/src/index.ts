@@ -1,5 +1,7 @@
 export { KoraClient } from "./KoraClient";
 export type { KoraAddresses } from "./KoraClient";
+export { loadKoraAddresses, manifestToAddresses } from "./deployment";
+export type { DeploymentManifest } from "./deployment";
 export {
   AccessControlClient,
   FinancingPoolClient,

@@ -220,6 +220,7 @@ TREASURY_HASH=$(sha256sum "$WASM_DIR/kora_treasury.wasm" | awk '{print $1}')
 POOL_HASH=$(sha256sum "$WASM_DIR/kora_financing_pool.wasm" | awk '{print $1}')
 MARKETPLACE_HASH=$(sha256sum "$WASM_DIR/kora_marketplace.wasm" | awk '{print $1}')
 RISK_HASH=$(sha256sum "$WASM_DIR/kora_risk_registry.wasm" | awk '{print $1}')
+PRICE_ORACLE_HASH=$(sha256sum "$WASM_DIR/kora_price_oracle.wasm" | awk '{print $1}')
 
 cat > "$DEPLOY_LOG" <<EOF
 {
@@ -258,6 +259,10 @@ cat > "$DEPLOY_LOG" <<EOF
     "risk_registry": {
       "address": "$RISK_REGISTRY_ID",
       "wasm_hash": "$RISK_HASH"
+    },
+    "price_oracle": {
+      "address": "$PRICE_ORACLE_ID",
+      "wasm_hash": "$PRICE_ORACLE_HASH"
     }
   }
 }
