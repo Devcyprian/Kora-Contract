@@ -15,3 +15,4 @@ kora-financing-pool = { path = "../financing_pool" }
 kora-treasury = { path = "../treasury" }
 kora-risk-registry = { path = "../risk_registry" }
 kora-access-control = { path = "../access_control" }
+kora-price-oracle = { path = "../price_oracle" }
