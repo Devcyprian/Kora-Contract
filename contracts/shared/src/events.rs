@@ -160,7 +160,6 @@ pub fn repayment_made(env: &Env, invoice_id: u64, payer: &Address, amount: i128)
 pub fn installment_paid(env: &Env, invoice_id: u64, payer: &Address, index: u32, amount: i128) {
     emit(
         env,
-        symbol_short!("INSTLPAID"),
         symbol_short!("INSTMT_PD"),
         (payer.clone(), invoice_id, index, amount, env.ledger().timestamp()),
     );
@@ -219,7 +218,6 @@ pub fn fee_collected(
 ) {
     emit(
         env,
-        symbol_short!("FEE_COLL"),
         symbol_short!("FEE_COL"),
         (
             investor.clone(),
@@ -297,7 +295,6 @@ pub fn protocol_paused(env: &Env, by: &Address) {
 pub fn protocol_unpaused(env: &Env, by: &Address) {
     emit(
         env,
-        symbol_short!("AC_UNPSD"),
         symbol_short!("UNPAUSED"),
         (by.clone(), env.ledger().timestamp()),
     );
@@ -376,7 +373,6 @@ pub fn position_recorded(
 ) {
     emit(
         env,
-        symbol_short!("POS_RECD"),
         symbol_short!("POS_RECRD"),
         (
             admin.clone(),
@@ -395,7 +391,6 @@ pub fn position_recorded(
 pub fn verifier_added(env: &Env, admin: &Address, verifier: &Address) {
     emit(
         env,
-        symbol_short!("VRF_ADDED"),
         symbol_short!("VRF_ADD"),
         (admin.clone(), verifier.clone(), env.ledger().timestamp()),
     );
@@ -405,7 +400,6 @@ pub fn verifier_added(env: &Env, admin: &Address, verifier: &Address) {
 pub fn verifier_removed(env: &Env, admin: &Address, verifier: &Address) {
     emit(
         env,
-        symbol_short!("VRF_RMVD"),
         symbol_short!("VRF_REM"),
         (admin.clone(), verifier.clone(), env.ledger().timestamp()),
     );
@@ -424,7 +418,6 @@ pub fn sme_registered(env: &Env, verifier: &Address, sme: &Address, risk_score: 
 pub fn sme_score_updated(env: &Env, verifier: &Address, sme: &Address, new_score: u32) {
     emit(
         env,
-        symbol_short!("SME_SCORE"),
         symbol_short!("SME_UPD"),
         (verifier.clone(), sme.clone(), new_score, env.ledger().timestamp()),
     );
@@ -443,7 +436,6 @@ pub fn sme_default_recorded(env: &Env, admin: &Address, sme: &Address, total_def
 pub fn sme_invoice_count_incremented(env: &Env, sme: &Address, new_total: u32) {
     emit(
         env,
-        symbol_short!("SME_INVCT"),
         symbol_short!("SME_INV"),
         (sme.clone(), new_total, env.ledger().timestamp()),
     );
@@ -496,7 +488,6 @@ pub fn sub_account_removed(env: &Env, primary: &Address, sub_account: &Address) 
 pub fn upgrade_proposed(env: &Env, admin: &Address, wasm_hash: &soroban_sdk::BytesN<32>) {
     emit(
         env,
-        symbol_short!("AC_UPG_PR"),
         symbol_short!("UPG_PROP"),
         (admin.clone(), wasm_hash.clone(), env.ledger().timestamp()),
     );
@@ -506,7 +497,6 @@ pub fn upgrade_proposed(env: &Env, admin: &Address, wasm_hash: &soroban_sdk::Byt
 pub fn upgrade_executed(env: &Env, admin: &Address, wasm_hash: &soroban_sdk::BytesN<32>) {
     emit(
         env,
-        symbol_short!("AC_UPG_EX"),
         symbol_short!("UPG_EXEC"),
         (admin.clone(), wasm_hash.clone(), env.ledger().timestamp()),
     );
@@ -519,7 +509,6 @@ pub fn upgrade_executed(env: &Env, admin: &Address, wasm_hash: &soroban_sdk::Byt
 pub fn multisig_configured(env: &Env, threshold: u32, signer_count: u32) {
     emit(
         env,
-        symbol_short!("MSIG_CFG"),
         symbol_short!("MS_CFG"),
         (threshold, signer_count, env.ledger().timestamp()),
     );
@@ -529,7 +518,6 @@ pub fn multisig_configured(env: &Env, threshold: u32, signer_count: u32) {
 pub fn action_proposed(env: &Env, proposal_id: u64, proposer: &Address) {
     emit(
         env,
-        symbol_short!("ACT_PROP"),
         symbol_short!("MS_PROP"),
         (proposal_id, proposer.clone(), env.ledger().timestamp()),
     );
@@ -539,7 +527,6 @@ pub fn action_proposed(env: &Env, proposal_id: u64, proposer: &Address) {
 pub fn action_approved(env: &Env, proposal_id: u64, approver: &Address, approval_count: u32) {
     emit(
         env,
-        symbol_short!("ACT_APPR"),
         symbol_short!("MS_APPR"),
         (
             proposal_id,
@@ -554,7 +541,6 @@ pub fn action_approved(env: &Env, proposal_id: u64, approver: &Address, approval
 pub fn action_executed(env: &Env, proposal_id: u64, executor: &Address) {
     emit(
         env,
-        symbol_short!("ACT_EXEC"),
         symbol_short!("MS_EXEC"),
         (proposal_id, executor.clone(), env.ledger().timestamp()),
     );
@@ -566,7 +552,6 @@ pub fn action_executed(env: &Env, proposal_id: u64, executor: &Address) {
 pub fn refund_claimed(env: &Env, invoice_id: u64, investor: &Address, amount: i128) {
     emit(
         env,
-        symbol_short!("REFUND_CL"),
         symbol_short!("REFUND"),
         (
             investor.clone(),
@@ -767,6 +752,11 @@ pub fn metadata_hash_corrected(
             invoice_id,
             old_hash.clone(),
             new_hash.clone(),
+            env.ledger().timestamp(),
+        ),
+    );
+}
+
 // ── Dutch Auction / Decay Schedule Events (#439) ──────────────────────────────
 
 /// Schema: (actor=seller, invoice_id, floor_price, decay_end_ts, timestamp)
