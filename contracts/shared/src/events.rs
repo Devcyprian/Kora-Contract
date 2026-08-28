@@ -767,6 +767,11 @@ pub fn metadata_hash_corrected(
             invoice_id,
             old_hash.clone(),
             new_hash.clone(),
+            env.ledger().timestamp(),
+        ),
+    );
+}
+
 // ── Dutch Auction / Decay Schedule Events (#439) ──────────────────────────────
 
 /// Schema: (actor=seller, invoice_id, floor_price, decay_end_ts, timestamp)
