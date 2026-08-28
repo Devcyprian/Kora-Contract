@@ -75,6 +75,8 @@ pub enum AdminActionType {
     GrantRole,
     RevokeRole,
     TransferAdmin,
+    /// Admin key rotation for key-compromise recovery (emits ADM_ROT event).
+    RotateAdmin,
     ConfigureMultisig,
     ProposeUpgrade,
     ExecuteUpgrade,
