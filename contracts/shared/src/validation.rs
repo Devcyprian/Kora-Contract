@@ -768,6 +768,16 @@ mod tests {
         assert_eq!(safe_mul(0, i128::MAX).unwrap(), 0);
     }
 
+    #[test]
+    fn test_safe_mul_negative_operand() {
+        assert_eq!(safe_mul(-10, 2).unwrap(), -20);
+    }
+
+    #[test]
+    fn test_safe_div_zero_regression() {
+        assert_eq!(safe_div(10, 0).unwrap_err(), CommonError::InvalidAmount);
+    }
+
 
     #[test]
     fn test_bps_of_boundary_values() {
