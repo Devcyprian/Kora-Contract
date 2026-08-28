@@ -1940,6 +1940,22 @@ mod tests {
     }
 
     #[test]
+    fn test_initialize_sets_migration_version() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, InvoiceNftContract);
+        let client = InvoiceNftContractClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        let access_control = Address::generate(&env);
+        client.initialize(&admin, &access_control);
+
+        let version: Option<u32> = env.as_contract(&client.address, || {
+            env.storage().instance().get(&DataKey::MigrationVersion)
+        });
+        assert_eq!(version, Some(2));
+    }
+
+    #[test]
     fn test_initialize_already_initialized_fails() {
         let (env, admin, client) = setup();
         let access_control = Address::generate(&env);
@@ -2311,6 +2327,7 @@ mod tests {
         let result = client.try_set_repaid(&pool, &id);
         assert_eq!(result.unwrap_err().unwrap(), InvoiceNftError::ProtocolPaused);
     }
+
 
     #[test]
     fn test_set_repaid_refreshes_ttl() {
