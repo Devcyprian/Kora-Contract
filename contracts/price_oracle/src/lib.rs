@@ -5,6 +5,10 @@ use soroban_sdk::{contract, contracterror, contractimpl, contracttype, Address, 
 const MAX_STALENESS_SECS: u64 = 3600;
 const UPGRADE_TIMELOCK_DELAY: u64 = 86_400;
 
+/// Number of aggregated price snapshots retained per pair. One persistent
+/// entry holds the whole ring, so this bounds on-chain storage growth.
+const PRICE_HISTORY_CAP: u32 = 32;
+
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
 #[repr(u32)]
@@ -19,6 +23,7 @@ pub enum PriceOracleError {
     UpgradeTimelockNotElapsed = 8,
     ProtocolPaused = 9,
     NotFeeder = 10,
+    PriceHistoryNotAvailable = 11,
 }
 
 #[contracttype]
@@ -26,6 +31,16 @@ pub enum PriceOracleError {
 pub struct PriceData {
     pub price: i128,
     pub timestamp: u64,
+}
+
+/// Bounded ring buffer of aggregated price snapshots for one pair.
+/// `slots` fills up to `PRICE_HISTORY_CAP` entries, after which `next`
+/// wraps and the oldest entry is overwritten.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct PriceHistoryRing {
+    pub slots: Vec<PriceData>,
+    pub next: u32,
 }
 
 #[contracttype]
@@ -40,6 +55,8 @@ pub enum DataKey {
     FeederPrice(Symbol, Symbol, Address),
     /// Enumerable list of feeders that have submitted a price for a pair.
     PriceFeeders(Symbol, Symbol),
+    /// Bounded rolling history of aggregated price snapshots for a pair.
+    PriceHistory(Symbol, Symbol),
     BaseCurrency,
     MaxDeviation,
 }
@@ -115,10 +132,57 @@ impl PriceOracleContract {
             feeders.push_back(feeder);
             env.storage()
                 .persistent()
-                .set(&DataKey::PriceFeeders(base, quote), &feeders);
+                .set(&DataKey::PriceFeeders(base.clone(), quote.clone()), &feeders);
+        }
+
+        // Record the post-submission aggregate into the pair's rolling history so
+        // disputes can look up the price as of a past timestamp. The aggregate is
+        // fresh here, so get_price only errors in states that also make the
+        // snapshot meaningless; skip silently in that case.
+        if let Ok(aggregate) = Self::get_price(env.clone(), base.clone(), quote.clone()) {
+            Self::record_price_snapshot(&env, &base, &quote, aggregate.price);
         }
 
         Ok(())
+    }
+
+    /// Append an aggregated price snapshot to the pair's bounded ring buffer.
+    /// Multiple submissions within one ledger collapse into a single slot so a
+    /// burst of feeders cannot evict older history.
+    fn record_price_snapshot(env: &Env, base: &Symbol, quote: &Symbol, price: i128) {
+        let now = env.ledger().timestamp();
+        let key = DataKey::PriceHistory(base.clone(), quote.clone());
+        let mut ring: PriceHistoryRing = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or_else(|| PriceHistoryRing {
+                slots: Vec::new(env),
+                next: 0,
+            });
+
+        let snapshot = PriceData {
+            price,
+            timestamp: now,
+        };
+
+        let len = ring.slots.len();
+        if len > 0 {
+            let newest_idx = (ring.next + PRICE_HISTORY_CAP - 1) % PRICE_HISTORY_CAP;
+            if newest_idx < len && ring.slots.get(newest_idx).unwrap().timestamp == now {
+                ring.slots.set(newest_idx, snapshot);
+                env.storage().persistent().set(&key, &ring);
+                return;
+            }
+        }
+
+        if len < PRICE_HISTORY_CAP {
+            ring.slots.push_back(snapshot);
+        } else {
+            ring.slots.set(ring.next, snapshot);
+        }
+        ring.next = (ring.next + 1) % PRICE_HISTORY_CAP;
+        env.storage().persistent().set(&key, &ring);
     }
 
     /// Add an authorized feeder. Admin only.
@@ -204,6 +268,39 @@ impl PriceOracleContract {
             price: median,
             timestamp: min_timestamp,
         })
+    }
+
+    /// Return the retained aggregated price snapshot nearest to `timestamp`
+    /// without going past it (the price as of that moment). Errors with
+    /// `PriceHistoryNotAvailable` when no history exists for the pair or when
+    /// `timestamp` predates the oldest snapshot still in the ring.
+    pub fn get_price_at(
+        env: Env,
+        base: Symbol,
+        quote: Symbol,
+        timestamp: u64,
+    ) -> Result<PriceData, PriceOracleError> {
+        let ring: PriceHistoryRing = env
+            .storage()
+            .persistent()
+            .get(&DataKey::PriceHistory(base, quote))
+            .ok_or(PriceOracleError::PriceHistoryNotAvailable)?;
+
+        let mut best: Option<PriceData> = None;
+        for snapshot in ring.slots.iter() {
+            if snapshot.timestamp > timestamp {
+                continue;
+            }
+            let keep = match &best {
+                Some(current) => snapshot.timestamp >= current.timestamp,
+                None => true,
+            };
+            if keep {
+                best = Some(snapshot);
+            }
+        }
+
+        best.ok_or(PriceOracleError::PriceHistoryNotAvailable)
     }
 
     /// Convert an amount from one currency to another using the stored price.
@@ -615,5 +712,117 @@ mod tests {
         let quote = Symbol::new(&env, "USDC");
         let result = client.try_set_price(&feeder, &base, &quote, &11_000_000i128);
         assert!(result.is_ok());
+    }
+
+    // === Price history ring buffer
+
+    #[test]
+    fn test_price_history_records_and_query_nearest_prior() {
+        let (env, _admin, feeder, client) = setup();
+        let base = Symbol::new(&env, "EURC");
+        let quote = Symbol::new(&env, "USDC");
+
+        env.ledger().set_timestamp(100);
+        client.set_price(&feeder, &base, &quote, &11_000_000i128);
+        env.ledger().set_timestamp(200);
+        client.set_price(&feeder, &base, &quote, &12_000_000i128);
+        env.ledger().set_timestamp(300);
+        client.set_price(&feeder, &base, &quote, &13_000_000i128);
+
+        // Between snapshots: nearest prior is the t=200 snapshot.
+        let mid = client.get_price_at(&base, &quote, &250);
+        assert_eq!(mid.price, 12_000_000i128);
+        assert_eq!(mid.timestamp, 200);
+
+        // Exact match and future queries resolve to the newest snapshot.
+        assert_eq!(client.get_price_at(&base, &quote, &300).price, 13_000_000i128);
+        assert_eq!(client.get_price_at(&base, &quote, &999).price, 13_000_000i128);
+    }
+
+    #[test]
+    fn test_get_price_at_before_window_fails() {
+        let (env, _admin, feeder, client) = setup();
+        let base = Symbol::new(&env, "EURC");
+        let quote = Symbol::new(&env, "USDC");
+
+        env.ledger().set_timestamp(100);
+        client.set_price(&feeder, &base, &quote, &11_000_000i128);
+
+        let result = client.try_get_price_at(&base, &quote, &50);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_get_price_at_empty_history_fails() {
+        let (env, _admin, _feeder, client) = setup();
+        let base = Symbol::new(&env, "XLM");
+        let quote = Symbol::new(&env, "USDC");
+        let result = client.try_get_price_at(&base, &quote, &1_000);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_price_history_wraparound() {
+        let (env, _admin, feeder, client) = setup();
+        let base = Symbol::new(&env, "EURC");
+        let quote = Symbol::new(&env, "USDC");
+
+        // Fill past capacity: timestamps 1..=CAP+5, price = timestamp * 1e6.
+        let total: u64 = PRICE_HISTORY_CAP as u64 + 5;
+        for i in 1..=total {
+            env.ledger().set_timestamp(i * 10);
+            client.set_price(&feeder, &base, &quote, &((i as i128) * 1_000_000));
+        }
+
+        // Oldest retained timestamp is (total - CAP + 1) * 10.
+        let oldest_retained = (total - PRICE_HISTORY_CAP as u64 + 1) * 10;
+
+        // A timestamp older than the retained window is gone.
+        let evicted = client.try_get_price_at(&base, &quote, &(oldest_retained - 1));
+        assert!(evicted.is_err());
+
+        // A timestamp inside the retained window returns the right snapshot,
+        // proving indices were reused correctly after the wrap.
+        let probe_ts = oldest_retained + 25; // between two retained snapshots
+        let expected_i = (oldest_retained + 20) / 10;
+        let got = client.get_price_at(&base, &quote, &probe_ts);
+        assert_eq!(got.timestamp, oldest_retained + 20);
+        assert_eq!(got.price, (expected_i as i128) * 1_000_000);
+
+        // Newest snapshot is still retrievable.
+        assert_eq!(
+            client.get_price_at(&base, &quote, &(total * 10)).price,
+            (total as i128) * 1_000_000
+        );
+    }
+
+    #[test]
+    fn test_price_history_same_timestamp_dedup() {
+        let (env, admin, feeder, client) = setup();
+        let base = Symbol::new(&env, "EURC");
+        let quote = Symbol::new(&env, "USDC");
+        let feeder2 = Address::generate(&env);
+        client.add_feeder(&admin, &feeder2);
+
+        // Two feeders submit in the same ledger, then a later distinct submit.
+        env.ledger().set_timestamp(100);
+        client.set_price(&feeder, &base, &quote, &10_000_000i128);
+        client.set_price(&feeder2, &base, &quote, &10_000_000i128);
+        env.ledger().set_timestamp(200);
+        client.set_price(&feeder, &base, &quote, &12_000_000i128);
+
+        // The same-timestamp pair collapsed to one slot: a query just before
+        // t=200 still resolves to the t=100 snapshot, and the t=200 snapshot
+        // occupies the very next slot rather than slot index 2.
+        let ring: PriceHistoryRing = env.as_contract(&client.address, || {
+            env.storage()
+                .persistent()
+                .get(&DataKey::PriceHistory(base.clone(), quote.clone()))
+                .unwrap()
+        });
+        assert_eq!(ring.slots.len(), 2);
+        assert_eq!(ring.next, 2);
+        assert_eq!(client.get_price_at(&base, &quote, &199).timestamp, 100);
+        assert_eq!(client.get_price_at(&base, &quote, &200).timestamp, 200);
     }
 }
