@@ -19,6 +19,12 @@ pub enum PriceOracleError {
     UpgradeTimelockNotElapsed = 8,
     ProtocolPaused = 9,
     NotFeeder = 10,
+    /// Price submitted for a pegged pair is outside the configured tolerance.
+    PegDeviationExceeded = 11,
+    /// A PegConfig already exists for this (base, quote) pair.
+    PegAlreadyConfigured = 12,
+    /// No PegConfig found for this (base, quote) pair.
+    PegNotConfigured = 13,
 }
 
 #[contracttype]
@@ -26,6 +32,32 @@ pub enum PriceOracleError {
 pub struct PriceData {
     pub price: i128,
     pub timestamp: u64,
+}
+
+/// Peg configuration for a stablecoin / pegged pair (#589).
+///
+/// Feeders submitting a price for `(base, quote)` that deviates from
+/// `expected_ratio` by more than `tolerance_bps` basis points will trigger
+/// a `PEG_DEV` event.  If `auto_flag` is `true`, the pair is additionally
+/// marked as flagged (see `DataKey::PegFlagged`), which causes `set_price`
+/// to reject further submissions until an admin clears the flag.
+///
+/// `expected_ratio` uses the same 1e7 scale as all other prices in this
+/// contract (e.g. USDC/USD ≈ 10_000_000 = 1.0000000).
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct PegConfig {
+    /// Base currency symbol (e.g. `USDC`).
+    pub base: Symbol,
+    /// Quote currency symbol (e.g. `USD`).
+    pub quote: Symbol,
+    /// Expected price ratio at peg, scaled by 1e7 (e.g. 10_000_000 for 1:1).
+    pub expected_ratio: i128,
+    /// Allowed deviation from `expected_ratio` in basis points (e.g. 50 = 0.5%).
+    pub tolerance_bps: u32,
+    /// When true, a deviation event also flags the pair and blocks further
+    /// price submissions until an admin calls `clear_peg_flag`.
+    pub auto_flag: bool,
 }
 
 #[contracttype]
@@ -42,6 +74,11 @@ pub enum DataKey {
     PriceFeeders(Symbol, Symbol),
     BaseCurrency,
     MaxDeviation,
+    /// Peg configuration for a specific (base, quote) pair (#589).
+    PegConfig(Symbol, Symbol),
+    /// Set to `true` when a peg deviation has been detected and `auto_flag` is enabled.
+    /// Cleared by admin via `clear_peg_flag`. Blocks further `set_price` submissions.
+    PegFlagged(Symbol, Symbol),
 }
 
 #[contract]
@@ -92,6 +129,57 @@ impl PriceOracleContract {
             let expected_reciprocal = Self::compute_reciprocal(price)?;
             let tolerance_bps = 100; // 1% = 100 basis points
             Self::validate_reciprocal_tolerance(expected_reciprocal, reverse_data.price, tolerance_bps)?;
+        }
+
+        // ── Peg validation (#589) ─────────────────────────────────────────────
+        // Perform peg-specific tolerance check *after* the generic reciprocal
+        // guard so both guards run independently.  This intentionally uses a
+        // tighter, asset-specific tolerance rather than the global MaxDeviation.
+        if let Some(peg_cfg) = env
+            .storage()
+            .persistent()
+            .get::<_, PegConfig>(&DataKey::PegConfig(base.clone(), quote.clone()))
+        {
+            // Block submissions entirely if the pair is currently flagged.
+            if env
+                .storage()
+                .persistent()
+                .get::<_, bool>(&DataKey::PegFlagged(base.clone(), quote.clone()))
+                .unwrap_or(false)
+            {
+                return Err(PriceOracleError::PegDeviationExceeded);
+            }
+
+            // Compute allowed deviation window: expected ± (expected * tolerance_bps / 10_000)
+            let max_diff = peg_cfg
+                .expected_ratio
+                .checked_mul(peg_cfg.tolerance_bps as i128)
+                .and_then(|v| v.checked_div(10_000))
+                .ok_or(PriceOracleError::ArithmeticOverflow)?;
+
+            let deviation = (price - peg_cfg.expected_ratio).abs();
+            if deviation > max_diff {
+                // Emit a distinct PEG_DEV event so indexers can react immediately.
+                env.events().publish(
+                    (soroban_sdk::symbol_short!("PEG_DEV"),),
+                    (
+                        base.clone(),
+                        quote.clone(),
+                        price,
+                        peg_cfg.expected_ratio,
+                        deviation,
+                        env.ledger().timestamp(),
+                    ),
+                );
+
+                if peg_cfg.auto_flag {
+                    env.storage()
+                        .persistent()
+                        .set(&DataKey::PegFlagged(base.clone(), quote.clone()), &true);
+                }
+
+                return Err(PriceOracleError::PegDeviationExceeded);
+            }
         }
 
         let data = PriceData {
@@ -162,6 +250,113 @@ impl PriceOracleContract {
             .persistent()
             .set(&DataKey::MaxDeviation, &deviation_bps);
         Ok(())
+    }
+
+    // ── Peg Configuration (#589) ───────────────────────────────────────────────
+
+    /// Register or update a peg configuration for a currency pair. Admin only.
+    ///
+    /// Once set, every `set_price` submission for `(base, quote)` is validated
+    /// against `expected_ratio ± tolerance_bps`.  A `PEG_DEV` event is emitted
+    /// on deviation; if `auto_flag` is true the pair is also flagged, which
+    /// blocks further price submissions until `clear_peg_flag` is called.
+    ///
+    /// **Parameters:**
+    /// - `expected_ratio` — expected price at peg, 1e7-scaled (e.g. 10_000_000 for 1:1).
+    /// - `tolerance_bps`  — allowed deviation in basis points (50 = 0.5%).
+    ///
+    /// **Errors:**
+    /// - `PriceOracleError::NotAdmin` — caller is not the admin.
+    /// - `PriceOracleError::InvalidAmount` — `expected_ratio <= 0` or `tolerance_bps > 10_000`.
+    pub fn set_peg_config(
+        env: Env,
+        admin: Address,
+        base: Symbol,
+        quote: Symbol,
+        expected_ratio: i128,
+        tolerance_bps: u32,
+        auto_flag: bool,
+    ) -> Result<(), PriceOracleError> {
+        admin.require_auth();
+        Self::require_admin(&env, &admin)?;
+        if expected_ratio <= 0 {
+            return Err(PriceOracleError::InvalidAmount);
+        }
+        if tolerance_bps > 10_000 {
+            return Err(PriceOracleError::InvalidAmount);
+        }
+        let cfg = PegConfig {
+            base: base.clone(),
+            quote: quote.clone(),
+            expected_ratio,
+            tolerance_bps,
+            auto_flag,
+        };
+        env.storage()
+            .persistent()
+            .set(&DataKey::PegConfig(base, quote), &cfg);
+        Ok(())
+    }
+
+    /// Remove a peg configuration for a pair. Admin only.
+    ///
+    /// **Errors:**
+    /// - `PriceOracleError::NotAdmin` — caller is not the admin.
+    /// - `PriceOracleError::PegNotConfigured` — no peg config exists for this pair.
+    pub fn remove_peg_config(
+        env: Env,
+        admin: Address,
+        base: Symbol,
+        quote: Symbol,
+    ) -> Result<(), PriceOracleError> {
+        admin.require_auth();
+        Self::require_admin(&env, &admin)?;
+        let key = DataKey::PegConfig(base.clone(), quote.clone());
+        if !env.storage().persistent().has(&key) {
+            return Err(PriceOracleError::PegNotConfigured);
+        }
+        env.storage().persistent().remove(&key);
+        // Also clear any outstanding flag so price submissions resume.
+        env.storage()
+            .persistent()
+            .remove(&DataKey::PegFlagged(base, quote));
+        Ok(())
+    }
+
+    /// Read the peg configuration for a pair.
+    ///
+    /// Returns `None` if no peg config has been registered.
+    pub fn get_peg_config(env: Env, base: Symbol, quote: Symbol) -> Option<PegConfig> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::PegConfig(base, quote))
+    }
+
+    /// Clear a peg-deviation flag so price submissions for the pair can resume.
+    /// Admin only.
+    ///
+    /// **Errors:**
+    /// - `PriceOracleError::NotAdmin` — caller is not the admin.
+    pub fn clear_peg_flag(
+        env: Env,
+        admin: Address,
+        base: Symbol,
+        quote: Symbol,
+    ) -> Result<(), PriceOracleError> {
+        admin.require_auth();
+        Self::require_admin(&env, &admin)?;
+        env.storage()
+            .persistent()
+            .remove(&DataKey::PegFlagged(base, quote));
+        Ok(())
+    }
+
+    /// Returns `true` if the pair is currently flagged due to a peg deviation.
+    pub fn is_peg_flagged(env: Env, base: Symbol, quote: Symbol) -> bool {
+        env.storage()
+            .persistent()
+            .get::<_, bool>(&DataKey::PegFlagged(base, quote))
+            .unwrap_or(false)
     }
 
     /// Get the aggregated price for a pair (median of all active feeders).
@@ -613,6 +808,79 @@ mod tests {
         let (env, _admin, feeder, client) = setup();
         let base = Symbol::new(&env, "EURC");
         let quote = Symbol::new(&env, "USDC");
+        let result = client.try_set_price(&feeder, &base, &quote, &11_000_000i128);
+        assert!(result.is_ok());
+    }
+
+    // ── Peg validation tests (#589) ───────────────────────────────────────────
+
+    // Tolerance = 50 bps (0.5%), expected peg = 10_000_000 (1:1 scaled by 1e7).
+    // max_diff = 10_000_000 * 50 / 10_000 = 50_000
+    // Just-under boundary: 10_000_000 + 49_999 = 10_049_999 → accepted
+    #[test]
+    fn test_peg_deviation_just_under_tolerance_accepted() {
+        let (env, admin, feeder, client) = setup();
+        let base = Symbol::new(&env, "USDC");
+        let quote = Symbol::new(&env, "USD");
+        client.set_peg_config(&admin, &base, &quote, &10_000_000i128, &50u32, &false);
+        // price is 1 stroop below the max-allowed deviation
+        let result = client.try_set_price(&feeder, &base, &quote, &10_049_999i128);
+        assert!(result.is_ok(), "price just under tolerance should be accepted");
+    }
+
+    // Just-over boundary: 10_000_000 + 50_001 = 10_050_001 → rejected
+    #[test]
+    fn test_peg_deviation_just_over_tolerance_rejected() {
+        let (env, admin, feeder, client) = setup();
+        let base = Symbol::new(&env, "USDC");
+        let quote = Symbol::new(&env, "USD");
+        client.set_peg_config(&admin, &base, &quote, &10_000_000i128, &50u32, &false);
+        let result = client.try_set_price(&feeder, &base, &quote, &10_050_001i128);
+        assert!(result.is_err(), "price just over tolerance should be rejected");
+    }
+
+    // When auto_flag=true, a deviation both emits the event AND blocks further submissions.
+    #[test]
+    fn test_peg_auto_flag_blocks_subsequent_submissions() {
+        let (env, admin, feeder, client) = setup();
+        let base = Symbol::new(&env, "USDC");
+        let quote = Symbol::new(&env, "USD");
+        // Configure with tight 10-bps tolerance and auto_flag enabled.
+        client.set_peg_config(&admin, &base, &quote, &10_000_000i128, &10u32, &true);
+
+        // First submission deviates → flagged.
+        let _ = client.try_set_price(&feeder, &base, &quote, &10_100_000i128);
+        assert!(client.is_peg_flagged(&base, &quote), "pair should be flagged after deviation");
+
+        // Subsequent on-peg submission should also fail (pair is flagged).
+        let result = client.try_set_price(&feeder, &base, &quote, &10_000_000i128);
+        assert!(result.is_err(), "flagged pair must block all new submissions");
+
+        // After admin clears the flag, a valid submission succeeds.
+        client.clear_peg_flag(&admin, &base, &quote);
+        assert!(!client.is_peg_flagged(&base, &quote));
+        let result = client.try_set_price(&feeder, &base, &quote, &10_000_000i128);
+        assert!(result.is_ok(), "cleared pair should accept valid price");
+    }
+
+    // Exact-peg price (deviation == 0) is always accepted.
+    #[test]
+    fn test_peg_exact_ratio_accepted() {
+        let (env, admin, feeder, client) = setup();
+        let base = Symbol::new(&env, "USDC");
+        let quote = Symbol::new(&env, "USD");
+        client.set_peg_config(&admin, &base, &quote, &10_000_000i128, &50u32, &true);
+        let result = client.try_set_price(&feeder, &base, &quote, &10_000_000i128);
+        assert!(result.is_ok(), "exact-peg price must be accepted");
+    }
+
+    // Pairs without a PegConfig are unaffected by the peg check.
+    #[test]
+    fn test_no_peg_config_price_submission_unaffected() {
+        let (env, _admin, feeder, client) = setup();
+        let base = Symbol::new(&env, "EURC");
+        let quote = Symbol::new(&env, "USDC");
+        // No set_peg_config call — any price should pass.
         let result = client.try_set_price(&feeder, &base, &quote, &11_000_000i128);
         assert!(result.is_ok());
     }
