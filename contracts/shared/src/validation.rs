@@ -768,6 +768,7 @@ mod tests {
         assert_eq!(safe_mul(0, i128::MAX).unwrap(), 0);
     }
 
+
     #[test]
     fn test_bps_of_boundary_values() {
         // 100% (10_000 bps)
@@ -1752,6 +1753,11 @@ mod tests {
         assert!(require_amount_within_bounds(0, 0).is_ok());
         assert!(require_amount_within_bounds(1, 0).is_err());
         assert!(require_amount_within_bounds(-1, 0).is_err());
+    }
+
+    #[test]
+    fn test_require_amount_within_bounds_accepts_exact_max() {
+        assert!(require_amount_within_bounds(500, 500).is_ok());
     }
 
     #[test]
