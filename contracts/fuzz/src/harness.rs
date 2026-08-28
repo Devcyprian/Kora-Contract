@@ -7,7 +7,7 @@
 //! so auth-gated entry points have a real chance of hitting the authorised path
 //! instead of always failing the `require_auth` check.
 
-use soroban_sdk::testutils::{Address as _, Ledger, LedgerInfo};
+use soroban_sdk::testutils::{Address as _, EnvTestConfig, Ledger, LedgerInfo};
 use soroban_sdk::{token::StellarAssetClient, Address, Env};
 
 use kora_access_control::{AccessControlContract, AccessControlContractClient};
@@ -36,7 +36,12 @@ impl Protocol<'static> {
     /// calls use `try_*` so a config combination that a future contract change
     /// rejects does not poison the whole target.
     pub fn deploy() -> Protocol<'static> {
-        let env = Env::default();
+        let mut env = Env::default();
+        // Fuzzing deploys a fresh Env per input; without this every iteration
+        // writes a test-snapshot JSON to disk on drop.
+        env.set_config(EnvTestConfig {
+            capture_snapshot_at_drop: false,
+        });
         // risk_registry::add_verifier does a nested token transfer that needs
         // non-root auth, same as the integration harness.
         env.mock_all_auths_allowing_non_root_auth();

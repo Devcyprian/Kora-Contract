@@ -27,3 +27,6 @@ Cargo.lock.bak
 # Python artifacts
 __pycache__/
 *.pyc
+contracts/fuzz/fuzz/target/
+contracts/fuzz/fuzz/corpus/
+contracts/fuzz/fuzz/artifacts/
