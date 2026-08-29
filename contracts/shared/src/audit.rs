@@ -13,7 +13,7 @@ pub const MAX_AUDIT_LOG_SIZE: u64 = 500;
 #[derive(Clone, Debug)]
 pub struct AuditEntry {
     pub action: String,
-    pub actor: soroban_sdk::Address,
+    pub actor: Address,
     pub timestamp: u64,
     pub sequence: u64, // monotonically increasing, never resets
 }
@@ -44,7 +44,7 @@ pub fn chain_checksum(env: &Env, prev: &BytesN<32>, entry: &AuditEntry) -> Bytes
     buf.append(&actor_bytes);
 
     // action string bytes
-    let action_bytes: soroban_sdk::Bytes = entry.action.clone().into();
+    let action_bytes: Bytes = entry.action.clone().to_xdr(env);
     buf.append(&action_bytes);
 
     env.crypto().sha256(&buf)

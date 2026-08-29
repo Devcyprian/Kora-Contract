@@ -95,6 +95,38 @@ pub enum KoraError {
     InvestorNotAccredited = 124,
     // marketplace: amendment rejected because funding has already begun (#437)
     ListingAlreadyFunded = 125,
+
+    // access_control / marketplace multisig admin-action governance
+    AlreadyVoted = 113,
+    AlreadyApproved = 126,
+    ProposalNotFound = 140,
+    ProposalAlreadyExecuted = 141,
+    ProposalExpired = 142,
+    ThresholdNotMet = 143,
+    SignerNotFound = 144,
+    MultisigNotConfigured = 145,
+    MultisigApprovalRequired = 146,
+    QuorumRequired = 147,
+    UnauthorizedCaller = 148,
+    InvalidParameterValue = 149,
+
+    // marketplace dependency-migration and token-whitelist timelocks (#443-#446)
+    DependencyUpdateTimelockNotElapsed = 150,
+    NoDependencyUpdateProposed = 151,
+    TokenWhitelistTimelockNotElapsed = 152,
+    NoTokenWhitelistProposed = 153,
+
+    // treasury loss-reserve, recipient allowlist, emergency gating (#455-#458)
+    ContributionBelowMinimum = 154,
+    InsufficientReserveBalance = 155,
+    ReserveCallerNotAuthorized = 156,
+    EmergencyNotDeclared = 157,
+    RecipientNotAllowed = 158,
+    NoRecipientProposed = 159,
+    RecipientTimelockNotElapsed = 160,
+
+    // invoice_nft: per-SME mint rate limit exceeded
+    MintRateLimitExceeded = 161,
 }
 
 /// Common validation/arithmetic errors shared by every contract's

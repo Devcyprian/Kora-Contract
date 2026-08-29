@@ -196,7 +196,7 @@ impl AccessControlContract {
         let _guard = ReentrancyGuard::new(&env)?;
         env.storage().instance().set(&DataKey::Paused, &true);
         events::protocol_paused(&env, &admin);
-        Self::append_audit_entry(&env, &admin, AdminActionType::Pause, Bytes::new(&env));
+        Self::append_audit_entry(&env, &admin, AdminActionType::Pause, ().into_val(&env));
         Ok(())
     }
 
@@ -231,7 +231,7 @@ impl AccessControlContract {
         let _guard = ReentrancyGuard::new(&env)?;
         env.storage().instance().set(&DataKey::Paused, &false);
         events::protocol_unpaused(&env, &admin);
-        Self::append_audit_entry(&env, &admin, AdminActionType::Unpause, Bytes::new(&env));
+        Self::append_audit_entry(&env, &admin, AdminActionType::Unpause, ().into_val(&env));
         Ok(())
     }
 
@@ -279,7 +279,7 @@ impl AccessControlContract {
         Self::bump_persistent(&env, &DataKey::Role(target.clone()));
         Self::add_to_role_members(&env, &role, &target);
         events::role_granted(&env, &admin, &target);
-        let details = (&target, &role).into_val(&env);
+        let details = (target.clone(), role.clone()).into_val(&env);
         Self::append_audit_entry(&env, &admin, AdminActionType::GrantRole, details);
         Ok(())
     }
@@ -323,7 +323,7 @@ impl AccessControlContract {
             .remove(&DataKey::Role(target.clone()));
         Self::remove_from_role_members(&env, &current_role, &target);
         events::role_revoked(&env, &admin, &target);
-        let details = (&target, &current_role).into_val(&env);
+        let details = (target.clone(), current_role.clone()).into_val(&env);
         Self::append_audit_entry(&env, &admin, AdminActionType::RevokeRole, details);
         Ok(())
     }
@@ -473,7 +473,6 @@ impl AccessControlContract {
 
         let signer_count = signers.len();
         if threshold == 0 || threshold > signer_count {
-            return Err(KoraError::InvalidAmount);
             return Err(AccessControlError::InvalidThreshold);
         }
 
@@ -583,18 +582,6 @@ impl AccessControlContract {
             .storage()
             .persistent()
             .get(&DataKey::Proposal(proposal_id))
-            .ok_or(KoraError::ParameterProposalNotFound)?;
-
-        if proposal.executed {
-            return Err(KoraError::ParameterProposalAlreadyExecuted);
-        }
-        if env.ledger().timestamp() > proposal.expires_at {
-            return Err(KoraError::FundingDeadlinePassed);
-        }
-
-        for i in 0..proposal.approvals.len() {
-            if proposal.approvals.get(i).ok_or(KoraError::Unauthorized)? == approver {
-                return Err(KoraError::AlreadyInitialized);
             .ok_or(AccessControlError::ProposalNotFound)?;
 
         if proposal.executed {
@@ -654,16 +641,6 @@ impl AccessControlContract {
             .storage()
             .persistent()
             .get(&DataKey::Proposal(proposal_id))
-            .ok_or(KoraError::ParameterProposalNotFound)?;
-
-        if proposal.executed {
-            return Err(KoraError::ParameterProposalAlreadyExecuted);
-        }
-        if env.ledger().timestamp() > proposal.expires_at {
-            return Err(KoraError::FundingDeadlinePassed);
-        }
-        if proposal.approvals.len() < config.threshold {
-            return Err(KoraError::GovernanceThresholdNotMet);
             .ok_or(AccessControlError::ProposalNotFound)?;
 
         if proposal.executed {
@@ -816,7 +793,6 @@ impl AccessControlContract {
         env.storage()
             .persistent()
             .get(&DataKey::Proposal(proposal_id))
-            .ok_or(KoraError::ParameterProposalNotFound)
             .ok_or(AccessControlError::ProposalNotFound)
     }
 
@@ -931,7 +907,6 @@ impl AccessControlContract {
         }
         for i in 0..proposal.approvals.len() {
             if proposal.approvals.get(i).unwrap() == signer {
-                return Err(KoraError::AlreadyInitialized);
                 return Err(AccessControlError::AlreadyVoted);
             }
         }
@@ -979,7 +954,6 @@ impl AccessControlContract {
             return Err(AccessControlError::GovernanceThresholdNotMet);
         }
         if env.ledger().timestamp() < proposal.created_at + GOVERNANCE_TIMELOCK_DELAY {
-            return Err(KoraError::UpgradeTimelockNotElapsed);
             return Err(AccessControlError::GovernanceTimelockNotElapsed);
         }
 
@@ -1095,7 +1069,7 @@ impl AccessControlContract {
         let proposal = RecoveryProposal {
             id: proposal_id,
             proposer: proposer.clone(),
-            new_signers,
+            new_signers: new_signers.clone(),
             new_threshold,
             created_at: env.ledger().timestamp(),
             objections: Vec::new(&env),
@@ -1289,11 +1263,11 @@ impl AccessControlContract {
 
         if let Some(members) = env.storage().persistent().get::<_, Vec<Address>>(&DataKey::RoleMembers(role)) {
             let mut i = 0;
-            for j in skip..members.len() {
+            for j in skip..(members.len() as usize) {
                 if i >= page_size {
                     break;
                 }
-                if let Ok(addr) = members.get(j as u32) {
+                if let Some(addr) = members.get(j as u32) {
                     results.push_back(addr);
                 }
                 i += 1;
@@ -1440,7 +1414,7 @@ impl AccessControlContract {
         // Check if already present to avoid duplicates
         let mut found = false;
         for i in 0..members.len() {
-            if members.get(i).ok_or(AccessControlError::Unauthorized).unwrap() == address {
+            if &members.get(i).ok_or(AccessControlError::Unauthorized).unwrap() == address {
                 found = true;
                 break;
             }
@@ -1458,7 +1432,7 @@ impl AccessControlContract {
         if let Some(mut members) = env.storage().persistent().get::<_, Vec<Address>>(&key) {
             let mut found = false;
             for i in 0..members.len() {
-                if members.get(i).ok_or(AccessControlError::Unauthorized).unwrap() == address {
+                if &members.get(i).ok_or(AccessControlError::Unauthorized).unwrap() == address {
                     // Swap with last and pop to remove efficiently
                     let last = members.pop_back();
                     if i < members.len() {
@@ -1480,7 +1454,12 @@ impl AccessControlContract {
     }
 
     /// Append one entry to the ring-buffer audit log and emit the canonical event.
-    fn append_audit_entry(env: &Env, actor: &Address, action: AdminActionType, details: soroban_sdk::Bytes) {
+    fn append_audit_entry(
+        env: &Env,
+        actor: &Address,
+        action: AdminActionType,
+        _details: soroban_sdk::Val,
+    ) {
         let total: u64 = env
             .storage()
             .instance()
@@ -1545,11 +1524,11 @@ impl AccessControlContract {
     }
 
     fn load_multisig_config(env: &Env) -> Result<MultisigConfig, AccessControlError> {
-        env.storage()
+        return env
+            .storage()
             .persistent()
             .get(&DataKey::MultisigConfig)
-            .ok_or(KoraError::NotInitialized)
-            .ok_or(AccessControlError::MultisigNotConfigured)
+            .ok_or(AccessControlError::MultisigNotConfigured);
     }
 
     /// Fail with `RotationBlockedByPendingProposal` if any active (un-executed,
@@ -1595,23 +1574,7 @@ impl AccessControlContract {
                 return Ok(());
             }
         }
-        Err(KoraError::NotMultisigSigner)
-    }
-
-    /// Validate a proposed parameter value against its allowed range.
-    fn require_valid_parameter(key: &ParameterKey, value: u32) -> Result<(), KoraError> {
-        match key {
-            ParameterKey::FeeBps | ParameterKey::LatePenaltyBps => {
-                if value > 10_000 {
-                    return Err(KoraError::InvalidFeeRate);
-                }
-            }
-            ParameterKey::MaxRiskScore => {
-                if value > 100 {
-                    return Err(KoraError::InvalidRiskScore);
-                }
-            }
-        Err(AccessControlError::SignerNotFound)
+        return Err(AccessControlError::SignerNotFound);
     }
 
     /// Validate a proposed parameter value against its allowed range.
@@ -1621,11 +1584,9 @@ impl AccessControlContract {
             ParameterKey::MaxRiskScore => value <= 100,
         };
         if ok {
-            Ok(())
-        } else {
-            Err(AccessControlError::InvalidParameterValue)
+            return Ok(());
         }
-        Ok(())
+        return Err(AccessControlError::InvalidParameterValue);
     }
 }
 
