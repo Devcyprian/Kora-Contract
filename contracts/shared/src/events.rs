@@ -359,6 +359,22 @@ pub fn admin_transferred(env: &Env, actor: &Address, new_admin: &Address) {
     );
 }
 
+/// Emitted during deliberate key-rotation recovery (e.g. suspected compromise).
+/// Distinct from `admin_transferred` so off-chain monitors can alert specifically
+/// on rotation events. Schema: (actor=executor, old_admin, new_admin, timestamp)
+pub fn admin_rotated(env: &Env, executor: &Address, old_admin: &Address, new_admin: &Address) {
+    emit(
+        env,
+        symbol_short!("ADM_ROT"),
+        (
+            executor.clone(),
+            old_admin.clone(),
+            new_admin.clone(),
+            env.ledger().timestamp(),
+        ),
+    );
+}
+
 /// Schema: (actor=admin, target, timestamp)
 pub fn role_granted(env: &Env, admin: &Address, target: &Address) {
     emit(
