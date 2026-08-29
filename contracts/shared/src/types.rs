@@ -246,6 +246,12 @@ pub enum AdminAction {
     GrantRole(Address, u32),
     RevokeRole(Address),
     TransferAdmin(Address),
+    /// Rotate the admin key to a new address.
+    /// Identical effect to `TransferAdmin` but signals deliberate key-rotation
+    /// semantics (e.g. after a suspected compromise) rather than an ordinary
+    /// ownership handoff. Emits a dedicated `admin_rotated` event for
+    /// off-chain monitoring to alert on.
+    RotateAdmin(Address),
 }
 
 /// A multisig proposal awaiting approval

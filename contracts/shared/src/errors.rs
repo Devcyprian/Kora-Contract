@@ -155,8 +155,4 @@ pub enum CommonError {
     ArithmeticUnderflow = 11,
     /// Reentrancy guard triggered.
     Reentrancy = 12,
-    /// Byte slice has the wrong length (e.g. debtor_hash must be exactly 32 bytes).
-    InvalidLength = 13,
-    /// Batch size exceeds the contract's allowed maximum.
-    BatchSizeExceeded = 14,
 }

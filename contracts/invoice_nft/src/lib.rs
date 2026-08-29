@@ -19,12 +19,11 @@ use kora_shared::{
     reentrancy::ReentrancyGuard,
     types::{Invoice, InvoiceStatus, ProtocolConfig, RiskTier},
     validation::{
-        require_future_timestamp, require_max_length_bytes, require_max_length_string,
-        require_non_empty_bytes, require_non_empty_string, require_non_zero_amount,
-        require_risk_score_within_ceiling, require_valid_risk_score, MAX_DEBTOR_HASH_LEN,
+        extend_persistent_ttl, require_batch_size_within_limit, require_future_timestamp,
+        require_max_length_bytes, require_max_length_string, require_non_empty_bytes,
+        require_non_empty_string, require_non_zero_amount, require_risk_score_within_ceiling,
+        require_valid_risk_score, DEFAULT_TTL_BUMP, DEFAULT_TTL_THRESHOLD, MAX_DEBTOR_HASH_LEN,
         MAX_IPFS_CID_LEN, UPGRADE_TIMELOCK_DELAY,
-        require_valid_risk_score, extend_persistent_ttl, DEFAULT_TTL_THRESHOLD, DEFAULT_TTL_BUMP,
-        MAX_DEBTOR_HASH_LEN, MAX_IPFS_CID_LEN, UPGRADE_TIMELOCK_DELAY,
     },
 };
 use soroban_sdk::{contract, contracterror, contractimpl, contracttype, Address, Bytes, BytesN, Env, String, Symbol, Vec};
@@ -146,6 +145,16 @@ pub enum DataKey {
     AuditLogTotal,
     /// Persistent: an audit log entry at ring-buffer position `n`.
     AuditEntry(u64),
+    /// Persistent: Vec<u64> of invoice IDs minted by this SME, in mint order.
+    /// Appended to in mint_invoice/mint_invoices_batch, pruned in withdraw_invoice.
+    SmeInvoiceIds(Address),
+    /// Instance key: monotonic counter allocating the next batch-mint correlation ID.
+    NextBatchId,
+    /// Instance key: `MintRateLimit` config. Absent means minting is unthrottled,
+    /// preserving pre-existing behaviour for deployments that never configure it.
+    MintRateLimit,
+    /// Persistent: `(window_start_ts, mints_used)` rolling mint window for an SME.
+    SmeMintWindow(Address),
 }
 
 /// A dispute raised against an invoice's committed `metadata_hash`.
@@ -157,23 +166,6 @@ pub struct MetadataDispute {
     pub raised_at: u64,
     pub resolved: bool,
     pub upheld: bool,
-    /// Persistent: Vec<u64> of invoice IDs minted by this SME, in mint order.
-    /// Appended to in mint_invoice/mint_invoices_batch, pruned in withdraw_invoice.
-    SmeInvoiceIds(Address),
-    /// Instance key: monotonic counter allocating the next batch-mint correlation ID.
-    NextBatchId,
-    /// Instance key: `MintRateLimit` config. Absent means minting is unthrottled,
-    /// preserving pre-existing behaviour for deployments that never configure it.
-    MintRateLimit,
-    /// Persistent: `(window_start_ts, mints_used)` rolling mint window for an SME.
-    SmeMintWindow(Address),
-    // ── Admin audit log ───────────────────────────────────────────────────────
-    /// Next write position in the admin audit ring buffer (0..MAX_AUDIT_LOG_SIZE).
-    AuditLogHead,
-    /// Total admin actions ever recorded (monotonic; not capped at ring size).
-    AuditLogTotal,
-    /// An admin audit log entry at ring-buffer position `n`.
-    AuditEntry(u64),
 }
 
 /// Per-SME minting velocity cap: at most `max_mints` invoices per `window_secs`.
@@ -515,7 +507,7 @@ impl InvoiceNftContract {
             .unwrap_or(0i128);
         let new_exposure = outstanding
             .checked_add(amount)
-            .ok_or(KoraError::ArithmeticOverflow)?;
+            .ok_or(InvoiceNftError::ArithmeticOverflow)?;
 
         // Credit-limit enforcement: if a risk_registry is wired up, check the
         // SME's pre-approved credit limit against their current outstanding exposure.
@@ -528,7 +520,7 @@ impl InvoiceNftContract {
             if let Ok(profile) = rr.try_get_sme_profile(&sme) {
                 if let Ok(profile) = profile {
                     if profile.credit_limit > 0 && new_exposure > profile.credit_limit {
-                        return Err(KoraError::InvalidAmount);
+                        return Err(InvoiceNftError::CreditLimitExceeded);
                     }
                 }
             }
@@ -566,21 +558,6 @@ impl InvoiceNftContract {
             .persistent()
             .set(&DataKey::OutstandingExposure(sme.clone()), &new_exposure);
         Self::append_sme_invoice_id(&env, &sme, id);
-
-        // Track outstanding exposure for every SME regardless of whether a
-        // risk_registry is wired up (withdraw/repaid/defaulted always decrement
-        // it); the credit_limit check above only applies once a registry is wired.
-        let prev_exposure: i128 = env
-            .storage()
-            .persistent()
-            .get(&DataKey::OutstandingExposure(sme.clone()))
-            .unwrap_or(0i128);
-        env.storage().persistent().set(
-            &DataKey::OutstandingExposure(sme.clone()),
-            &prev_exposure
-                .checked_add(amount)
-                .ok_or(InvoiceNftError::ArithmeticOverflow)?,
-        );
 
         events::invoice_created(&env, id, &sme, invoice.amount, invoice.currency.clone());
         Ok(id)
@@ -633,7 +610,7 @@ impl InvoiceNftContract {
             let id = next_id;
             exposure_delta = exposure_delta
                 .checked_add(entry.amount)
-                .ok_or(KoraError::ArithmeticOverflow)?;
+                .ok_or(InvoiceNftError::ArithmeticOverflow)?;
 
             let invoice = Invoice {
                 id,
@@ -670,7 +647,7 @@ impl InvoiceNftContract {
                 .unwrap_or(0i128);
             let new_exposure = outstanding
                 .checked_add(exposure_delta)
-                .ok_or(KoraError::ArithmeticOverflow)?;
+                .ok_or(InvoiceNftError::ArithmeticOverflow)?;
             env.storage()
                 .persistent()
                 .set(&DataKey::OutstandingExposure(sme), &new_exposure);

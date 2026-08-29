@@ -1,6 +1,5 @@
 #![allow(unused)]
 
-use soroban_sdk::xdr::ToXdr;
 use soroban_sdk::{contracttype, Address, Bytes, BytesN, Env, String};
 
 /// Ring-buffer capacity for on-chain audit log.
@@ -48,7 +47,7 @@ pub fn chain_checksum(env: &Env, prev: &BytesN<32>, entry: &AuditEntry) -> Bytes
     let action_bytes: Bytes = entry.action.clone().to_xdr(env);
     buf.append(&action_bytes);
 
-    return env.crypto().sha256(&buf).to_bytes();
+    env.crypto().sha256(&buf)
 }
 
 /// Identifies which contract originated the admin action.
@@ -71,6 +70,8 @@ pub enum AdminActionType {
     GrantRole,
     RevokeRole,
     TransferAdmin,
+    /// Admin key rotation for key-compromise recovery (emits ADM_ROT event).
+    RotateAdmin,
     ConfigureMultisig,
     ProposeUpgrade,
     ExecuteUpgrade,

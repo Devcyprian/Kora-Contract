@@ -1,16 +1,6 @@
 use soroban_sdk::{Address, Bytes, Env, String};
 use crate::errors::CommonError;
 
-/// Reject risk scores above a protocol-configured ceiling, which may be
-/// stricter than (but never looser than) the hard 100 cap enforced by
-/// `require_valid_risk_score`.
-pub fn require_risk_score_within_ceiling(score: u32, ceiling: u32) -> Result<(), CommonError> {
-    if score > ceiling {
-        return Err(CommonError::InvalidRiskScore);
-    }
-    return Ok(());
-}
-
 /// Minimum timelock delay for upgrade proposals (24 hours in seconds).
 pub const UPGRADE_TIMELOCK_DELAY: u64 = 86_400;
 
