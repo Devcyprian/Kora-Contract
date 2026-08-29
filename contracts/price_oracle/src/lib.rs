@@ -5,6 +5,10 @@ use soroban_sdk::{contract, contracterror, contractimpl, contracttype, Address, 
 const MAX_STALENESS_SECS: u64 = 3600;
 const UPGRADE_TIMELOCK_DELAY: u64 = 86_400;
 
+/// Number of aggregated price snapshots retained per pair. One persistent
+/// entry holds the whole ring, so this bounds on-chain storage growth.
+const PRICE_HISTORY_CAP: u32 = 32;
+
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
 #[repr(u32)]
@@ -72,6 +76,8 @@ pub enum DataKey {
     FeederPrice(Symbol, Symbol, Address),
     /// Enumerable list of feeders that have submitted a price for a pair.
     PriceFeeders(Symbol, Symbol),
+    /// Bounded rolling history of aggregated price snapshots for a pair.
+    PriceHistory(Symbol, Symbol),
     BaseCurrency,
     MaxDeviation,
     /// Peg configuration for a specific (base, quote) pair (#589).
@@ -203,10 +209,57 @@ impl PriceOracleContract {
             feeders.push_back(feeder);
             env.storage()
                 .persistent()
-                .set(&DataKey::PriceFeeders(base, quote), &feeders);
+                .set(&DataKey::PriceFeeders(base.clone(), quote.clone()), &feeders);
+        }
+
+        // Record the post-submission aggregate into the pair's rolling history so
+        // disputes can look up the price as of a past timestamp. The aggregate is
+        // fresh here, so get_price only errors in states that also make the
+        // snapshot meaningless; skip silently in that case.
+        if let Ok(aggregate) = Self::get_price(env.clone(), base.clone(), quote.clone()) {
+            Self::record_price_snapshot(&env, &base, &quote, aggregate.price);
         }
 
         Ok(())
+    }
+
+    /// Append an aggregated price snapshot to the pair's bounded ring buffer.
+    /// Multiple submissions within one ledger collapse into a single slot so a
+    /// burst of feeders cannot evict older history.
+    fn record_price_snapshot(env: &Env, base: &Symbol, quote: &Symbol, price: i128) {
+        let now = env.ledger().timestamp();
+        let key = DataKey::PriceHistory(base.clone(), quote.clone());
+        let mut ring: PriceHistoryRing = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or_else(|| PriceHistoryRing {
+                slots: Vec::new(env),
+                next: 0,
+            });
+
+        let snapshot = PriceData {
+            price,
+            timestamp: now,
+        };
+
+        let len = ring.slots.len();
+        if len > 0 {
+            let newest_idx = (ring.next + PRICE_HISTORY_CAP - 1) % PRICE_HISTORY_CAP;
+            if newest_idx < len && ring.slots.get(newest_idx).unwrap().timestamp == now {
+                ring.slots.set(newest_idx, snapshot);
+                env.storage().persistent().set(&key, &ring);
+                return;
+            }
+        }
+
+        if len < PRICE_HISTORY_CAP {
+            ring.slots.push_back(snapshot);
+        } else {
+            ring.slots.set(ring.next, snapshot);
+        }
+        ring.next = (ring.next + 1) % PRICE_HISTORY_CAP;
+        env.storage().persistent().set(&key, &ring);
     }
 
     /// Add an authorized feeder. Admin only.
@@ -399,6 +452,39 @@ impl PriceOracleContract {
             price: median,
             timestamp: min_timestamp,
         })
+    }
+
+    /// Return the retained aggregated price snapshot nearest to `timestamp`
+    /// without going past it (the price as of that moment). Errors with
+    /// `PriceHistoryNotAvailable` when no history exists for the pair or when
+    /// `timestamp` predates the oldest snapshot still in the ring.
+    pub fn get_price_at(
+        env: Env,
+        base: Symbol,
+        quote: Symbol,
+        timestamp: u64,
+    ) -> Result<PriceData, PriceOracleError> {
+        let ring: PriceHistoryRing = env
+            .storage()
+            .persistent()
+            .get(&DataKey::PriceHistory(base, quote))
+            .ok_or(PriceOracleError::PriceHistoryNotAvailable)?;
+
+        let mut best: Option<PriceData> = None;
+        for snapshot in ring.slots.iter() {
+            if snapshot.timestamp > timestamp {
+                continue;
+            }
+            let keep = match &best {
+                Some(current) => snapshot.timestamp >= current.timestamp,
+                None => true,
+            };
+            if keep {
+                best = Some(snapshot);
+            }
+        }
+
+        best.ok_or(PriceOracleError::PriceHistoryNotAvailable)
     }
 
     /// Convert an amount from one currency to another using the stored price.
