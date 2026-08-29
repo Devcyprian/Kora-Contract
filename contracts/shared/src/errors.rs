@@ -21,9 +21,7 @@ pub enum KoraError {
 
     // Invoice
     InvoiceNotFound = 10,
-    InvoiceAlreadyExists = 11,
     InvalidInvoiceStatus = 12,
-    InvoiceExpired = 13,
     InvalidAmount = 14,
     InvalidDueDate = 15,
     InvalidRiskScore = 16,
@@ -34,47 +32,26 @@ pub enum KoraError {
     // Marketplace
     ListingNotFound = 20,
     ListingAlreadyCancelled = 21,
-    ListingExpired = 22,
     FundingDeadlinePassed = 23,
     InsufficientFunds = 24,
     ExceedsFundingTarget = 25,
-    AlreadyFullyFunded = 26,
     ListingFullyFunded = 27,
     FundingNotExpired = 28,
-    RefundAlreadyClaimed = 29,
-    NoContribution = 95,
-    /// funding_deadline is too close to the invoice's due_date (#441)
-    FundingDeadlineTooCloseToDueDate = 124,
-    /// A bidding window is active; direct fund_invoice is not allowed in bidding mode (#440)
-    BiddingWindowActive = 125,
-    /// The bidding window has closed; no new bids may be submitted (#440)
-    BiddingWindowClosed = 126,
-    /// No bid found for the given (invoice_id, investor) pair (#440)
-    BidNotFound = 127,
-    /// Investor already has an active bid on this invoice (#440)
-    BidAlreadyExists = 128,
 
     // Pool
     PoolNotFound = 30,
     PoolAlreadyClosed = 31,
-    RepaymentAlreadyMade = 32,
-    InsufficientPoolBalance = 33,
     PositionNotFound = 34,
     SaleAlreadyListed = 35,
     SaleNotFound = 36,
 
     // Treasury
     InvalidFeeRate = 40,
-    WithdrawalFailed = 41,
     TokenNotWhitelisted = 42,
     WithdrawalRateLimitExceeded = 43,
-    WithdrawalCapTimelockNotElapsed = 44,
-    NoCapChangeProposed = 45,
 
     // Risk
     SMENotRegistered = 50,
-    DebtorNotRegistered = 51,
-    RiskScoreOutOfRange = 52,
     ComplianceNotAttested = 53,
     // SME profile exists but has not been marked `verified` by a risk_registry verifier
     SMENotVerified = 129,
@@ -96,16 +73,11 @@ pub enum KoraError {
     // Upgrade
     NoUpgradeProposed = 100,
     UpgradeTimelockNotElapsed = 101,
-    // Field value exceeds the allowed maximum length (was mistakenly = 95; fixed to 103)
-    FieldTooLong = 103,
     // Parameter governance
     ParameterProposalNotFound = 110,
     ParameterProposalAlreadyExecuted = 111,
     NotMultisigSigner = 112,
-    AlreadyVoted = 113,
     GovernanceThresholdNotMet = 114,
-    GovernanceTimelockNotElapsed = 115,
-    InvalidParameterValue = 116,
     // Cooldown between debtor risk score updates per (verifier, debtor_hash) pair
     ScoreUpdateCooldownNotElapsed = 117,
     // Marketplace two-phase cancellation
@@ -117,6 +89,44 @@ pub enum KoraError {
     CreditLimitExceeded = 121,
     // invoice_nft: currency symbol is not on the allowlist
     CurrencyNotAllowed = 122,
+    // marketplace: investor's prospective share would exceed the per-listing concentration cap (#435)
+    InvestorConcentrationExceeded = 123,
+    // marketplace: investor address has not been marked accredited (#436)
+    InvestorNotAccredited = 124,
+    // marketplace: amendment rejected because funding has already begun (#437)
+    ListingAlreadyFunded = 125,
+
+    // access_control / marketplace multisig admin-action governance
+    AlreadyVoted = 113,
+    AlreadyApproved = 126,
+    ProposalNotFound = 140,
+    ProposalAlreadyExecuted = 141,
+    ProposalExpired = 142,
+    ThresholdNotMet = 143,
+    SignerNotFound = 144,
+    MultisigNotConfigured = 145,
+    MultisigApprovalRequired = 146,
+    QuorumRequired = 147,
+    UnauthorizedCaller = 148,
+    InvalidParameterValue = 149,
+
+    // marketplace dependency-migration and token-whitelist timelocks (#443-#446)
+    DependencyUpdateTimelockNotElapsed = 150,
+    NoDependencyUpdateProposed = 151,
+    TokenWhitelistTimelockNotElapsed = 152,
+    NoTokenWhitelistProposed = 153,
+
+    // treasury loss-reserve, recipient allowlist, emergency gating (#455-#458)
+    ContributionBelowMinimum = 154,
+    InsufficientReserveBalance = 155,
+    ReserveCallerNotAuthorized = 156,
+    EmergencyNotDeclared = 157,
+    RecipientNotAllowed = 158,
+    NoRecipientProposed = 159,
+    RecipientTimelockNotElapsed = 160,
+
+    // invoice_nft: per-SME mint rate limit exceeded
+    MintRateLimitExceeded = 161,
 }
 
 /// Common validation/arithmetic errors shared by every contract's
@@ -145,8 +155,4 @@ pub enum CommonError {
     ArithmeticUnderflow = 11,
     /// Reentrancy guard triggered.
     Reentrancy = 12,
-    /// Byte slice has the wrong length (e.g. debtor_hash must be exactly 32 bytes).
-    InvalidLength = 13,
-    /// Batch size exceeds the contract's allowed maximum.
-    BatchSizeExceeded = 14,
 }

@@ -2,6 +2,24 @@ use crate::audit::AdminAuditEntry;
 use crate::types::RiskTier;
 use soroban_sdk::{symbol_short, Address, Bytes, Env, Symbol, Vec};
 
+// ── Event Schema Version (#583) ───────────────────────────────────────────────
+//
+// EVENT_SCHEMA_VERSION is the current schema generation for all Kora events.
+// Off-chain indexers MUST check the "SCHEMA_V" topic on every event to detect
+// contract upgrades that change field count, order, or types.
+//
+// Versioning policy:
+//   • Additive change (new optional field appended to an existing event):
+//     increment the MINOR digit only (no topic bump required for pure appends
+//     at the end of an existing tuple, but SCHEMA_V must be bumped so indexers
+//     know to re-check the schema catalogue).
+//   • Breaking change (field removed, type changed, or ordering altered):
+//     increment the MAJOR digit and update docs/EVENTS.md with migration notes.
+//
+// Current version: 1 (initial versioned release).
+// See docs/EVENTS.md §"Schema Versioning" for the full changelog.
+pub const EVENT_SCHEMA_VERSION: u32 = 1;
+
 // ── Canonical Event Schema ────────────────────────────────────────────────────
 //
 // Every event published by the Kora protocol follows this payload convention:
@@ -16,9 +34,20 @@ use soroban_sdk::{symbol_short, Address, Bytes, Env, Symbol, Vec};
 //
 // Events that carry multiple data fields extend this tuple while preserving
 // the actor-first, timestamp-last ordering.
+//
+// Each event is published with two topics: ("SCHEMA_V", <event_topic>).
+// The first topic carries EVENT_SCHEMA_VERSION so off-chain indexers can gate
+// on the version without decoding the payload.
 
 fn emit(env: &Env, topic: Symbol, data: impl soroban_sdk::IntoVal<Env, soroban_sdk::Val>) {
-    env.events().publish((topic,), data);
+    env.events()
+        .publish((symbol_short!("SCHEMA_V"), topic, EVENT_SCHEMA_VERSION), data);
+}
+
+/// Returns the current event schema version constant.
+/// Indexers and tests can call this to assert the version they were built against.
+pub fn schema_version() -> u32 {
+    EVENT_SCHEMA_VERSION
 }
 
 // ── Invoice Events ────────────────────────────────────────────────────────────
@@ -256,6 +285,21 @@ pub fn fee_rate_updated(env: &Env, by: &Address, old_bps: u32, new_bps: u32) {
     );
 }
 
+/// Emitted when part of a funding fee is routed to the invoice's referrer.
+/// Schema: (invoice_id, referrer, referral_fee, timestamp)
+pub fn referral_fee_paid(env: &Env, invoice_id: u64, referrer: &Address, referral_fee: i128) {
+    emit(
+        env,
+        symbol_short!("REF_FEE"),
+        (
+            invoice_id,
+            referrer.clone(),
+            referral_fee,
+            env.ledger().timestamp(),
+        ),
+    );
+}
+
 /// Schema: (actor=admin, fee_bps, timestamp)
 pub fn treasury_initialized(env: &Env, admin: &Address, fee_bps: u32) {
     emit(
@@ -312,6 +356,22 @@ pub fn admin_transferred(env: &Env, actor: &Address, new_admin: &Address) {
     );
 }
 
+/// Emitted during deliberate key-rotation recovery (e.g. suspected compromise).
+/// Distinct from `admin_transferred` so off-chain monitors can alert specifically
+/// on rotation events. Schema: (actor=executor, old_admin, new_admin, timestamp)
+pub fn admin_rotated(env: &Env, executor: &Address, old_admin: &Address, new_admin: &Address) {
+    emit(
+        env,
+        symbol_short!("ADM_ROT"),
+        (
+            executor.clone(),
+            old_admin.clone(),
+            new_admin.clone(),
+            env.ledger().timestamp(),
+        ),
+    );
+}
+
 /// Schema: (actor=admin, target, timestamp)
 pub fn role_granted(env: &Env, admin: &Address, target: &Address) {
     emit(
@@ -365,6 +425,21 @@ pub fn position_recorded(
             investor.clone(),
             contributed,
             share_bps,
+            env.ledger().timestamp(),
+        ),
+    );
+}
+
+/// Cross-invoice net settlement event emitted once per `net_settle` call (#588).
+/// Schema: (actor=payer, invoice_ids, total_amount, timestamp)
+pub fn net_settled(env: &Env, payer: &Address, invoice_ids: &Vec<u64>, total_amount: i128) {
+    emit(
+        env,
+        symbol_short!("NET_SETTL"),
+        (
+            payer.clone(),
+            invoice_ids.clone(),
+            total_amount,
             env.ledger().timestamp(),
         ),
     );
@@ -567,21 +642,85 @@ pub fn position_sold(env: &Env, invoice_id: u64, seller: &Address, buyer: &Addre
 
 // ── Treasury Cap Events ───────────────────────────────────────────────────────
 
-/// Schema: (actor=admin, new_cap, timestamp)
-pub fn withdrawal_cap_proposed(env: &Env, admin: &Address, new_cap: i128) {
+/// Schema: (actor=admin, token, new_cap, timestamp)
+pub fn withdrawal_cap_proposed(env: &Env, admin: &Address, token: &Address, new_cap: i128) {
     emit(
         env,
         symbol_short!("WTH_CAP_P"),
-        (admin.clone(), new_cap, env.ledger().timestamp()),
+        (admin.clone(), token.clone(), new_cap, env.ledger().timestamp()),
     );
 }
 
-/// Schema: (actor=admin, old_cap, new_cap, timestamp)
-pub fn withdrawal_cap_updated(env: &Env, admin: &Address, old_cap: i128, new_cap: i128) {
+/// Schema: (actor=admin, token, old_cap, new_cap, timestamp)
+pub fn withdrawal_cap_updated(env: &Env, admin: &Address, token: &Address, old_cap: i128, new_cap: i128) {
     emit(
         env,
         symbol_short!("WTH_CAP_U"),
-        (admin.clone(), old_cap, new_cap, env.ledger().timestamp()),
+        (admin.clone(), token.clone(), old_cap, new_cap, env.ledger().timestamp()),
+    );
+}
+
+/// Schema: (actor=admin, timestamp)
+pub fn emergency_declared(env: &Env, admin: &Address) {
+    emit(
+        env,
+        symbol_short!("EMRG_DECL"),
+        (admin.clone(), env.ledger().timestamp()),
+    );
+}
+
+/// Schema: (actor=admin, timestamp)
+pub fn emergency_revoked(env: &Env, admin: &Address) {
+    emit(
+        env,
+        symbol_short!("EMRG_REVK"),
+        (admin.clone(), env.ledger().timestamp()),
+    );
+}
+
+/// Schema: (actor=admin, access_control, timestamp)
+pub fn access_control_updated(env: &Env, admin: &Address, access_control: &Address) {
+    emit(
+        env,
+        symbol_short!("AC_SET"),
+        (admin.clone(), access_control.clone(), env.ledger().timestamp()),
+    );
+}
+
+// ── Treasury Recipient Allowlist Events (#457) ───────────────────────────────
+
+/// Schema: (actor=admin, recipient, timestamp)
+pub fn recipient_proposed(env: &Env, admin: &Address, recipient: &Address) {
+    emit(
+        env,
+        symbol_short!("RCP_PROP"),
+        (admin.clone(), recipient.clone(), env.ledger().timestamp()),
+    );
+}
+
+/// Schema: (actor=admin, recipient, timestamp)
+pub fn recipient_allowed(env: &Env, admin: &Address, recipient: &Address) {
+    emit(
+        env,
+        symbol_short!("RCP_ALLOW"),
+        (admin.clone(), recipient.clone(), env.ledger().timestamp()),
+    );
+}
+
+// ── Treasury Insurance Reserve Events (#458) ─────────────────────────────────
+
+/// Schema: (actor=caller, token, recipient, amount, timestamp)
+pub fn reserve_disbursed(env: &Env, caller: &Address, token: &Address, recipient: &Address, amount: i128) {
+    emit(
+        env,
+        symbol_short!("RSRV_DISB"),
+        (
+            caller.clone(),
+            token.clone(),
+            recipient.clone(),
+            amount,
+            env.ledger().timestamp(),
+        ),
     );
 }
 
@@ -591,8 +730,18 @@ pub fn withdrawal_cap_updated(env: &Env, admin: &Address, old_cap: i128, new_cap
 pub fn sme_credit_limit_set(env: &Env, verifier: &Address, sme: &Address, credit_limit: i128) {
     emit(
         env,
-        symbol_short!("SME_CLSET"),
+        symbol_short!("SME_CL"),
         (verifier.clone(), sme.clone(), credit_limit, env.ledger().timestamp()),
+    );
+}
+
+/// Schema: (actor=admin, sme, new_verifier, timestamp)
+/// Emitted when the admin reassigns an SME to a new verifier-of-record.
+pub fn sme_verifier_reassigned(env: &Env, admin: &Address, sme: &Address, new_verifier: &Address) {
+    emit(
+        env,
+        symbol_short!("SME_REAS"),
+        (admin.clone(), sme.clone(), new_verifier.clone(), env.ledger().timestamp()),
     );
 }
 
@@ -624,6 +773,47 @@ pub fn cancellation_requested(env: &Env, invoice_id: u64, caller: &Address) {
         env,
         symbol_short!("CXL_REQ"),
         (caller.clone(), invoice_id, env.ledger().timestamp()),
+    );
+}
+
+// ── Metadata Hash Dispute Events ──────────────────────────────────────────────
+
+/// Schema: (actor=challenger, invoice_id, timestamp)
+pub fn metadata_mismatch_flagged(env: &Env, invoice_id: u64, challenger: &Address) {
+    emit(
+        env,
+        symbol_short!("MTD_DISP"),
+        (challenger.clone(), invoice_id, env.ledger().timestamp()),
+    );
+}
+
+/// Schema: (actor=admin, invoice_id, upheld, timestamp)
+pub fn metadata_dispute_resolved(env: &Env, invoice_id: u64, admin: &Address, upheld: bool) {
+    emit(
+        env,
+        symbol_short!("MTD_RES"),
+        (admin.clone(), invoice_id, upheld, env.ledger().timestamp()),
+    );
+}
+
+/// Schema: (actor=admin, invoice_id, old_hash, new_hash, timestamp)
+pub fn metadata_hash_corrected(
+    env: &Env,
+    invoice_id: u64,
+    admin: &Address,
+    old_hash: &Bytes,
+    new_hash: &Bytes,
+) {
+    emit(
+        env,
+        symbol_short!("MTD_CORR"),
+        (
+            admin.clone(),
+            invoice_id,
+            old_hash.clone(),
+            new_hash.clone(),
+            env.ledger().timestamp(),
+        ),
     );
 }
 
@@ -712,6 +902,44 @@ pub fn admin_action_audited(env: &Env, entry: &AdminAuditEntry) {
             entry.action.clone(),
             entry.source.clone(),
             entry.timestamp,
+        ),
+    );
+}
+
+// ── Audit Events ─────────────────────────────────────────────────────────────
+
+/// Emitted on every admin action — canonical off-chain history source.
+pub fn adm_audit(env: &Env, sequence: u64, action: soroban_sdk::String, actor: &Address, timestamp: u64) {
+    emit(
+        env,
+        symbol_short!("ADM_AUDT"),
+        (sequence, action, actor.clone(), timestamp),
+    );
+}
+
+/// Emitted right before a ring-buffer wraparound begins overwriting old entries.
+/// Carries the rolling checksum that commits the full history up to this point,
+/// and the raw entry that is about to be discarded — giving off-chain systems an
+/// unambiguous, permanent archival signal.
+pub fn audit_checkpoint(
+    env: &Env,
+    total_entries: u64,
+    checksum: soroban_sdk::BytesN<32>,
+    discarded_action: soroban_sdk::String,
+    discarded_actor: &Address,
+    discarded_timestamp: u64,
+    discarded_sequence: u64,
+) {
+    emit(
+        env,
+        symbol_short!("AUDT_CHK"),
+        (
+            total_entries,
+            checksum,
+            discarded_action,
+            discarded_actor.clone(),
+            discarded_timestamp,
+            discarded_sequence,
         ),
     );
 }

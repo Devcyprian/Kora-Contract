@@ -27,6 +27,10 @@ Cargo.lock.bak
 # Python artifacts
 __pycache__/
 *.pyc
-contracts/fuzz/fuzz/target/
-contracts/fuzz/fuzz/corpus/
-contracts/fuzz/fuzz/artifacts/
+
+# Node/TS artifacts (sdk/)
+node_modules/
+dist/
+*.tsbuildinfo
+npm-debug.log*
+*.log

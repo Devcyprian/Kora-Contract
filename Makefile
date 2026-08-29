@@ -60,10 +60,15 @@ fuzz-deep:
 	cd contracts/fuzz/fuzz && cargo +nightly fuzz run fuzz_$(FUZZ_TARGET) -- -runs=$(FUZZ_RUNS)
 
 # ── Audit ─────────────────────────────────────────────────────────────────────
+#
+# Run locally to replicate the `supply-chain-audit` CI gate (issue #609).
+# Requires:  cargo install cargo-deny --locked --version 0.14.24
+#            cargo install cargo-audit --locked --version 0.21.0
+# Exception process: see deny.toml and docs/INCIDENT_RESPONSE.md §7b.
 
 audit:
-	cargo audit
 	cargo deny check
+	cargo audit --deny warnings
 
 coverage:
 	@echo "Running coverage analysis (threshold: $(COVERAGE_MIN)%)..."

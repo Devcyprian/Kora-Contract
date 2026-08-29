@@ -246,6 +246,12 @@ pub enum AdminAction {
     GrantRole(Address, u32),
     RevokeRole(Address),
     TransferAdmin(Address),
+    /// Rotate the admin key to a new address.
+    /// Identical effect to `TransferAdmin` but signals deliberate key-rotation
+    /// semantics (e.g. after a suspected compromise) rather than an ordinary
+    /// ownership handoff. Emits a dedicated `admin_rotated` event for
+    /// off-chain monitoring to alert on.
+    RotateAdmin(Address),
 }
 
 /// A multisig proposal awaiting approval
@@ -257,6 +263,7 @@ pub struct Proposal {
     pub proposer: Address,
     pub approvals: Vec<Address>,
     pub executed: bool,
+    pub cancelled: bool,
     pub created_at: u64,
     pub expires_at: u64,
 }
@@ -290,5 +297,21 @@ pub struct ParameterProposal {
     pub proposer: Address,
     pub approvals: Vec<Address>, // signers that have voted in favour
     pub created_at: u64,
+    pub expires_at: u64,
+    pub executed: bool,
+    pub cancelled: bool,
+}
+
+/// A multisig signer recovery proposal for lost-key scenarios.
+/// Allows reconfiguring the signer set after a long timelock if quorum becomes unreachable.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct RecoveryProposal {
+    pub id: u64,
+    pub proposer: Address,
+    pub new_signers: Vec<Address>,
+    pub new_threshold: u32,
+    pub created_at: u64,
+    pub objections: Vec<Address>, // signers that have objected to recovery
     pub executed: bool,
 }
