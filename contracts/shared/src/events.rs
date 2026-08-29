@@ -2,6 +2,24 @@ use crate::audit::AdminAuditEntry;
 use crate::types::RiskTier;
 use soroban_sdk::{symbol_short, Address, Bytes, Env, Symbol, Vec};
 
+// ── Event Schema Version (#583) ───────────────────────────────────────────────
+//
+// EVENT_SCHEMA_VERSION is the current schema generation for all Kora events.
+// Off-chain indexers MUST check the "SCHEMA_V" topic on every event to detect
+// contract upgrades that change field count, order, or types.
+//
+// Versioning policy:
+//   • Additive change (new optional field appended to an existing event):
+//     increment the MINOR digit only (no topic bump required for pure appends
+//     at the end of an existing tuple, but SCHEMA_V must be bumped so indexers
+//     know to re-check the schema catalogue).
+//   • Breaking change (field removed, type changed, or ordering altered):
+//     increment the MAJOR digit and update docs/EVENTS.md with migration notes.
+//
+// Current version: 1 (initial versioned release).
+// See docs/EVENTS.md §"Schema Versioning" for the full changelog.
+pub const EVENT_SCHEMA_VERSION: u32 = 1;
+
 // ── Canonical Event Schema ────────────────────────────────────────────────────
 //
 // Every event published by the Kora protocol follows this payload convention:
@@ -16,9 +34,20 @@ use soroban_sdk::{symbol_short, Address, Bytes, Env, Symbol, Vec};
 //
 // Events that carry multiple data fields extend this tuple while preserving
 // the actor-first, timestamp-last ordering.
+//
+// Each event is published with two topics: ("SCHEMA_V", <event_topic>).
+// The first topic carries EVENT_SCHEMA_VERSION so off-chain indexers can gate
+// on the version without decoding the payload.
 
 fn emit(env: &Env, topic: Symbol, data: impl soroban_sdk::IntoVal<Env, soroban_sdk::Val>) {
-    env.events().publish((topic,), data);
+    env.events()
+        .publish((symbol_short!("SCHEMA_V"), topic, EVENT_SCHEMA_VERSION), data);
+}
+
+/// Returns the current event schema version constant.
+/// Indexers and tests can call this to assert the version they were built against.
+pub fn schema_version() -> u32 {
+    EVENT_SCHEMA_VERSION
 }
 
 // ── Invoice Events ────────────────────────────────────────────────────────────
@@ -330,6 +359,22 @@ pub fn admin_transferred(env: &Env, actor: &Address, new_admin: &Address) {
     );
 }
 
+/// Emitted during deliberate key-rotation recovery (e.g. suspected compromise).
+/// Distinct from `admin_transferred` so off-chain monitors can alert specifically
+/// on rotation events. Schema: (actor=executor, old_admin, new_admin, timestamp)
+pub fn admin_rotated(env: &Env, executor: &Address, old_admin: &Address, new_admin: &Address) {
+    emit(
+        env,
+        symbol_short!("ADM_ROT"),
+        (
+            executor.clone(),
+            old_admin.clone(),
+            new_admin.clone(),
+            env.ledger().timestamp(),
+        ),
+    );
+}
+
 /// Schema: (actor=admin, target, timestamp)
 pub fn role_granted(env: &Env, admin: &Address, target: &Address) {
     emit(
@@ -384,6 +429,21 @@ pub fn position_recorded(
             investor.clone(),
             contributed,
             share_bps,
+            env.ledger().timestamp(),
+        ),
+    );
+}
+
+/// Cross-invoice net settlement event emitted once per `net_settle` call (#588).
+/// Schema: (actor=payer, invoice_ids, total_amount, timestamp)
+pub fn net_settled(env: &Env, payer: &Address, invoice_ids: &Vec<u64>, total_amount: i128) {
+    emit(
+        env,
+        symbol_short!("NET_SETTL"),
+        (
+            payer.clone(),
+            invoice_ids.clone(),
+            total_amount,
             env.ledger().timestamp(),
         ),
     );
@@ -767,6 +827,11 @@ pub fn metadata_hash_corrected(
             invoice_id,
             old_hash.clone(),
             new_hash.clone(),
+            env.ledger().timestamp(),
+        ),
+    );
+}
+
 // ── Dutch Auction / Decay Schedule Events (#439) ──────────────────────────────
 
 /// Schema: (actor=seller, invoice_id, floor_price, decay_end_ts, timestamp)

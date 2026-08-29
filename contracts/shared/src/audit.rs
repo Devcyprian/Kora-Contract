@@ -1,6 +1,6 @@
 #![allow(unused)]
 
-use soroban_sdk::{contracttype, Bytes, BytesN, Env, String};
+use soroban_sdk::{contracttype, Address, Bytes, BytesN, Env, String};
 
 /// Ring-buffer capacity for on-chain audit log.
 /// Complete history is always available off-chain via the canonical ADM_AUDIT event.
@@ -48,12 +48,7 @@ pub fn chain_checksum(env: &Env, prev: &BytesN<32>, entry: &AuditEntry) -> Bytes
     buf.append(&action_bytes);
 
     env.crypto().sha256(&buf)
-use soroban_sdk::{contracttype, Address};
-
-/// Maximum entries in the on-chain audit ring buffer per contract.
-/// Once full, the oldest entry is overwritten. Complete history is always
-/// available off-chain via the canonical `ADM_AUDIT` event.
-pub const MAX_AUDIT_LOG_SIZE: u64 = 500;
+}
 
 /// Identifies which contract originated the admin action.
 #[contracttype]
@@ -75,6 +70,8 @@ pub enum AdminActionType {
     GrantRole,
     RevokeRole,
     TransferAdmin,
+    /// Admin key rotation for key-compromise recovery (emits ADM_ROT event).
+    RotateAdmin,
     ConfigureMultisig,
     ProposeUpgrade,
     ExecuteUpgrade,
